@@ -1,0 +1,1367 @@
+---
+title: "Weather Data Exploratory Data Analysis"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+---
+
+## 1. Load Packages and Data
+
+```{r setup, message=FALSE, warning=FALSE}
+setwd("/Users/mingju/Desktop/600/capstone")
+
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(ggplot2)
+
+load("weather.rda")
+```
+
+## 2. Transform Data into Long Format
+
+```{r data-transformation, message=FALSE, warning=FALSE}
+weather_long <- weather %>%
+  rownames_to_column(var = "date") %>%
+  mutate(
+    across(
+      matches("^[A-Z]{3}_PrecipitationIn$"),
+      ~ {
+        x <- as.character(.x)
+        x[x %in% c("T", "")] <- NA
+        as.numeric(x)
+      }
+    )
+  ) %>%
+  pivot_longer(
+    cols = matches("^[A-Z]{3}_"),
+    names_to = c("airport", ".value"),
+    names_pattern = "^([^_]+)_(.*)$"
+  ) %>%
+  mutate(date = as.Date(date))
+```
+
+## 3. Check the Transformed Data
+
+```{r check-data}
+head(weather_long)
+dim(weather_long)
+names(weather_long)
+```
+
+## 4. Daily Temperature Trends Across Airports
+
+### 4.1 Prepare Temperature Data
+
+```{r prepare-temperature-data}
+temperature_long <- weather_long %>%
+  select(
+    date,
+    airport,
+    Max.TemperatureF,
+    Mean.TemperatureF,
+    Min.TemperatureF
+  ) %>%
+  pivot_longer(
+    cols = c(
+      Max.TemperatureF,
+      Mean.TemperatureF,
+      Min.TemperatureF
+    ),
+    names_to = "temperature_type",
+    values_to = "temperature"
+  ) %>%
+  mutate(
+    temperature_type = recode(
+      temperature_type,
+      Max.TemperatureF = "Daily Maximum Temperature",
+      Mean.TemperatureF = "Daily Mean Temperature",
+      Min.TemperatureF = "Daily Minimum Temperature"
+    )
+  )
+```
+
+### Remove outlier and report missing values
+
+```{r}
+# Remove outliers using the IQR rule
+temperature_clean <- temperature_long %>%
+  group_by(airport, temperature_type) %>%
+  mutate(
+    Q1 = quantile(temperature, 0.25, na.rm = TRUE),
+    Q3 = quantile(temperature, 0.75, na.rm = TRUE),
+    IQR_value = Q3 - Q1,
+    lower_bound = Q1 - 3 * IQR_value,
+    upper_bound = Q3 + 3 * IQR_value,
+    is_outlier = !is.na(temperature) &
+      (temperature < lower_bound | temperature > upper_bound),
+    temperature = ifelse(is_outlier, NA, temperature)
+  ) %>%
+  ungroup()
+
+# Report missing values and removed outliers
+missing_summary <- temperature_clean %>%
+  group_by(temperature_type) %>%
+  summarise(
+    total_observations = n(),
+    original_missing = sum(is.na(temperature_long$temperature[
+      match(
+        interaction(airport, date, temperature_type),
+        interaction(
+          temperature_long$airport,
+          temperature_long$date,
+          temperature_long$temperature_type
+        )
+      )
+    ])),
+    outliers_removed = sum(is_outlier),
+    missing_after_removal = sum(is.na(temperature)),
+    .groups = "drop"
+  )
+
+print(missing_summary)
+```
+
+### 4.3 Plot Temperature Trends
+
+```{r temperature-trends, fig.width=15, fig.height=5}
+ggplot(
+  temperature_clean,
+  aes(
+    x = date,
+    y = temperature,
+    color = airport,
+    group = airport
+  )
+) +
+  geom_line(alpha = 0.7, linewidth = 0.4, na.rm = TRUE) +
+  facet_wrap(
+    ~ temperature_type,
+    nrow = 1,
+    scales = "free_y"
+  ) +
+  labs(
+    title = "Daily Temperature Trends Across Airports",
+    x = "Date",
+    y = "Temperature (°F)",
+    color = "Airport"
+  ) +
+  theme_bw() +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.text = element_text(face = "bold"),
+    plot.title = element_text(hjust = 0.5)
+  )
+```
+
+### Lag 1, ... Lag 5 ACF
+
+```{r temperature-autocorrelation, fig.width=12, fig.height=6}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+# --------------------------------------------------
+# 1. Calculate empirical autocorrelation (lags 1 to 5)
+# --------------------------------------------------
+
+autocorr_data <- temperature_clean %>%
+  arrange(airport, date) %>%
+  group_by(airport, temperature_type) %>%
+  summarise(
+    acf = list(
+      sapply(1:5, function(k) {
+        cor(
+          temperature,
+          dplyr::lag(temperature, k),
+          use = "complete.obs"
+        )
+      })
+    ),
+    .groups = "drop"
+  ) %>%
+  unnest_longer(acf, indices_to = "lag") %>%
+  mutate(lag = as.integer(lag))
+
+# --------------------------------------------------
+# 2. Plot empirical autocorrelation
+# --------------------------------------------------
+
+ggplot(
+  autocorr_data,
+  aes(x = lag, y = acf, group = airport, color = airport)
+) +
+  geom_line(alpha = 0.7) +
+  geom_point(size = 2) +
+  facet_wrap(~ temperature_type, nrow = 1) +
+  scale_x_continuous(breaks = 1:5) +
+  scale_y_continuous(limits = c(-1, 1)) +
+  labs(
+    title = "Autocorrelation of Temperature (Lag 1–5)",
+    x = "Lag (days)",
+    y = "Autocorrelation",
+    color = "Airport"
+  ) +
+  theme_bw() +
+  theme(
+    legend.position = "none",
+    strip.text = element_text(face = "bold"),
+    plot.title = element_text(hjust = 0.5)
+  )
+
+
+# --------------------------------------------------
+# 3. Calculate theoretical ACF under AR(1)-type structure
+# --------------------------------------------------
+
+acf_comparison <- autocorr_data %>%
+  group_by(airport, temperature_type) %>%
+  mutate(
+    rho_hat = acf[lag == 1][1],
+    theoretical_acf = rho_hat^lag
+  ) %>%
+  ungroup()
+
+# --------------------------------------------------
+# 4. Plot empirical vs. theoretical ACF
+# --------------------------------------------------
+
+ggplot(
+  acf_comparison,
+  aes(x = theoretical_acf, y = acf, color = airport)
+) +
+  geom_point(size = 2, alpha = 0.8) +
+  geom_abline(
+    slope = 1,
+    intercept = 0,
+    linetype = "dashed",
+    color = "black",
+    linewidth = 0.8
+  ) +
+  facet_grid(
+    temperature_type ~ lag,
+    labeller = labeller(
+      lag = function(x) paste("Lag", x)
+    )
+  ) +
+  coord_equal(xlim = c(-1, 1), ylim = c(-1, 1)) +
+  labs(
+    title = "Empirical vs. Theoretical ACF by Lag",
+    x = "Theoretical ACF",
+    y = "Empirical ACF",
+    color = "Airport"
+  ) +
+  theme_bw() +
+  theme(
+    legend.position = "none",
+    strip.text = element_text(face = "bold"),
+    plot.title = element_text(hjust = 0.5)
+  )
+```
+
+
+```{r temperature-relationships, fig.width=15, fig.height=10, warning=FALSE, message=FALSE}
+# --------------------------------------------------
+# 1. Select relevant weather variables
+# --------------------------------------------------
+
+temperature_vars <- c(
+  "Max.TemperatureF",
+  "Mean.TemperatureF",
+  "Min.TemperatureF"
+)
+
+selected_vars <- c(
+  "MeanDew.PointF",
+  "Min.DewpointF",
+  "Max.Humidity",
+  "Mean.Humidity",
+  "Mean.Wind.SpeedMPH",
+  "PrecipitationIn"
+)
+
+# Keep only variables that actually exist in the dataset
+selected_vars <- intersect(
+  selected_vars,
+  names(weather_long)
+)
+
+# --------------------------------------------------
+# 2. Prepare data
+# --------------------------------------------------
+
+relationship_data <- weather_long %>%
+  select(
+    all_of(c(temperature_vars, selected_vars))
+  ) %>%
+  pivot_longer(
+    cols = all_of(selected_vars),
+    names_to = "variable",
+    values_to = "weather_value"
+  ) %>%
+  pivot_longer(
+    cols = all_of(temperature_vars),
+    names_to = "temperature_type",
+    values_to = "temperature"
+  ) %>%
+  mutate(
+    temperature_type = recode(
+      temperature_type,
+      Max.TemperatureF = "Maximum Temperature",
+      Mean.TemperatureF = "Mean Temperature",
+      Min.TemperatureF = "Minimum Temperature"
+    )
+  ) %>%
+  filter(
+    !is.na(weather_value),
+    !is.na(temperature)
+  )
+
+# --------------------------------------------------
+# 3. Calculate correlations
+# --------------------------------------------------
+
+correlation_data <- relationship_data %>%
+  group_by(temperature_type, variable) %>%
+  summarise(
+    correlation = cor(
+      weather_value,
+      temperature,
+      method = "pearson"
+    ),
+    .groups = "drop"
+  )
+
+print(correlation_data)
+
+# --------------------------------------------------
+# 4. Correlation heatmap
+# --------------------------------------------------
+
+p1 <- ggplot(
+  correlation_data,
+  aes(
+    x = variable,
+    y = temperature_type,
+    fill = correlation
+  )
+) +
+  geom_tile(color = "white") +
+  geom_text(
+    aes(label = round(correlation, 2)),
+    size = 3
+  ) +
+  scale_fill_gradient2(
+    low = "blue",
+    mid = "white",
+    high = "red",
+    midpoint = 0,
+    limits = c(-1, 1)
+  ) +
+  labs(
+    title = "Correlation Between Temperature and Selected Weather Variables",
+    x = "Weather Variable",
+    y = "Temperature",
+    fill = "Correlation"
+  ) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(
+      angle = 45,
+      hjust = 1
+    ),
+    plot.title = element_text(hjust = 0.5)
+  )
+
+print(p1)
+
+# --------------------------------------------------
+# 5. Scatterplots with LOESS curves
+# --------------------------------------------------
+
+# p2 <- ggplot(
+#   relationship_data,
+#   aes(
+#     x = weather_value,
+#     y = temperature,
+#     color = temperature_type
+#   )
+# ) +
+#   geom_point(
+#     alpha = 0.15,
+#     size = 0.5
+#   ) +
+#   facet_wrap(
+#     ~ variable,
+#     scales = "free",
+#     ncol = 3
+#   ) +
+#   labs(
+#     title = "Temperature vs. Selected Weather Variables",
+#     x = "Weather Variable",
+#     y = "Temperature (°F)",
+#     color = "Temperature"
+#   ) +
+#   theme_bw() +
+#   theme(
+#     strip.text = element_text(face = "bold"),
+#     plot.title = element_text(hjust = 0.5),
+#     legend.position = "bottom"
+#   )
+# 
+# print(p2)
+```
+
+
+## Model and Selection Procedure
+
+For each temperature outcome (daily maximum, mean, and minimum) we
+build a system of five linear models, one per forecast horizon
+\(l=1,\ldots,5\), and choose its structure by cross-validation. The
+three outcomes are treated separately.
+
+### Forecasting Model
+
+Let \(y_{a,s}\) be the outcome at airport \(a\) on day \(s\), let
+\(t\) be the forecast origin (the last observed day), and let \(d_t\)
+be its day of the year. The forecast for the \(l\) ahead day is
+
+\[
+\widehat y_{a,t+l}
+=
+\beta_{0,l}
++
+\sum_{j=1}^{h}\beta_{j,l}\,\widetilde y_{a,t+l-j}
++
+\mathbf W_{a,t}^\top\boldsymbol\gamma_l
++
+\delta_{a,l}
++
+S^{(m)}_{a,l}(d_t),
+\qquad
+\widetilde y_{a,s} =
+\begin{cases}
+y_{a,s}, & s\le t,\\
+\widehat y_{a,s}, & s>t.
+\end{cases}
+\]
+
+- **Temperature history.** The model uses the \(h\) days preceding
+  the target day. Days after the origin are not yet observed, so
+  their forecasts are used instead; the five forecasts are therefore
+  produced sequentially. When \(h=0\) the term is omitted.
+- **Weather on the origin day.** \(\mathbf W_{a,t}\) contains the
+  other numeric weather variables observed on day \(t\) (including
+  the two other temperature measures), the sine and cosine of wind
+  direction, and indicators for the weather-event category.
+- **Airport effect.** \(\delta_{a,l}\) is an airport-specific
+  intercept.
+- **Seasonal structure.** With \(\omega=2\pi/365.25\), we compare
+  four choices of \(S^{(m)}_{a,l}\):
+
+\[
+\begin{aligned}
+\text{none:}\quad & S_{a,l}(d)=0,\\[2pt]
+\text{shared:}\quad & S_{a,l}(d)=\sum_{k=1}^{2}
+  \bigl[\alpha_{k,l}\sin(k\omega d)+\zeta_{k,l}\cos(k\omega d)\bigr],\\[2pt]
+\text{airport1:}\quad & S_{a,l}(d)=\text{shared}
+  +\alpha_{a,1,l}\sin(\omega d)+\zeta_{a,1,l}\cos(\omega d),\\[2pt]
+\text{airport2:}\quad & S_{a,l}(d)=\text{shared}
+  +\sum_{k=1}^{2}\bigl[\alpha_{a,k,l}\sin(k\omega d)
+  +\zeta_{a,k,l}\cos(k\omega d)\bigr].
+\end{aligned}
+\]
+
+The first harmonic (\(k=1\)) is one smooth annual cycle and the
+second (\(k=2\)) lets that cycle be asymmetric. Under *shared* every
+airport follows the same cycle and differs only in level. Under
+*airport1* each airport has its own annual amplitude and phase, and
+under *airport2* its own asymmetry as well. Airport-specific
+coefficients are deviations from the shared ones and are zero for a
+reference airport.
+
+Each harmonic enters as a sine and cosine pair because the pair is a
+single wave whose size and timing are both free:
+
+\[
+\alpha\sin(k\omega d)+\zeta\cos(k\omega d)
+=
+A\cos\bigl(k\omega(d-d_0)\bigr),
+\qquad
+A=\sqrt{\alpha^2+\zeta^2}.
+\]
+
+The amplitude \(A\) is half the distance between the warmest and
+coldest points of the wave, and the phase \(d_0\) is the day on
+which it peaks. Estimating \(\alpha\) and \(\zeta\) by linear
+regression therefore chooses both. Figure \ref{fig:harmonic-concepts}
+shows the two properties, and how adding a second harmonic makes the
+rise and the fall of the cycle differ.
+
+```{r harmonic-concepts, echo=FALSE, fig.width=10, fig.height=3.2, fig.cap="\\label{fig:harmonic-concepts}What the harmonic terms control. Left: amplitude. Middle: phase. Right: a second harmonic added to the first makes the annual cycle asymmetric."}
+omega <- 2 * pi / 365.25
+month_starts <- c(1, 32, 60, 91, 121, 152, 182, 213, 244, 274, 305, 335)
+month_labels <- c("J", "F", "M", "A", "M", "J", "J", "A", "S", "O", "N", "D")
+wave <- function(day, amplitude, peak, k = 1) {
+  amplitude * cos(k * omega * (day - peak))
+}
+day <- 1:365
+concept_panels <- c(
+  "Amplitude: size of the swing",
+  "Phase: date of the peak",
+  "Second harmonic: asymmetry"
+)
+concept_curves <- bind_rows(
+  tibble(panel = concept_panels[1], curve = "a", day, value = wave(day, 25, 200)),
+  tibble(panel = concept_panels[1], curve = "b", day, value = wave(day, 10, 200)),
+  tibble(panel = concept_panels[2], curve = "a", day, value = wave(day, 20, 200)),
+  tibble(panel = concept_panels[2], curve = "b", day, value = wave(day, 20, 240)),
+  tibble(panel = concept_panels[3], curve = "a", day, value = wave(day, 20, 200)),
+  tibble(panel = concept_panels[3], curve = "b", day,
+         value = wave(day, 20, 200) + wave(day, 5, 245, k = 2))
+) %>%
+  mutate(panel = factor(panel, levels = concept_panels))
+concept_labels <- tibble(
+  panel = factor(rep(concept_panels, each = 2), levels = concept_panels),
+  curve = rep(c("a", "b"), 3),
+  day = c(100, 200, 150, 290, 85, 322),
+  value = c(22, 3.5, 24, 24, 22, 23),
+  label = c(
+    "amplitude 25", "amplitude 10",
+    "peak 19 Jul", "peak 28 Aug",
+    "first harmonic\nonly", "first + second\nharmonic"
+  )
+)
+ggplot(concept_curves, aes(day, value, color = curve)) +
+  geom_hline(yintercept = 0, color = "grey70", linewidth = 0.3) +
+  geom_line(linewidth = 0.8) +
+  geom_text(aes(label = label), data = concept_labels, size = 3.1,
+            lineheight = 0.9, show.legend = FALSE) +
+  facet_wrap(~ panel, nrow = 1) +
+  scale_color_manual(values = c(a = "#2a78d6", b = "#eb6834"), guide = "none") +
+  scale_x_continuous(breaks = month_starts, labels = month_labels,
+                     expand = c(0.01, 0)) +
+  scale_y_continuous(limits = c(-27, 27)) +
+  labs(x = "Month", y = "Seasonal effect (°F)") +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank(),
+        strip.text = element_text(face = "bold"))
+```
+
+Figure \ref{fig:harmonic-fits} applies the three seasonal structures
+to the daily mean temperature at four target airports, using the
+calendar date alone. A shared cycle has the wrong amplitude for
+airports with unusually large or small annual swings. An
+airport-specific first harmonic corrects the amplitude and the date
+of the peak, and an airport-specific second harmonic adds a smaller
+correction to the shape.
+
+```{r harmonic-fits, echo=FALSE, fig.width=10, fig.height=3.8, fig.cap="\\label{fig:harmonic-fits}Seasonal structures fitted to daily mean temperature on the calendar date alone. Points are averages over 2005 to 2014 for each day of the year."}
+example_airports <- c(
+  DLH = "Duluth (DLH)", SLC = "Salt Lake City (SLC)",
+  SFO = "San Francisco (SFO)", EYW = "Key West (EYW)"
+)
+seasonal_data <- temperature_clean %>%
+  filter(temperature_type == "Daily Mean Temperature", !is.na(temperature)) %>%
+  mutate(
+    day = as.integer(format(date, "%j")),
+    sin1 = sin(omega * day), cos1 = cos(omega * day),
+    sin2 = sin(2 * omega * day), cos2 = cos(2 * omega * day)
+  )
+# The three seasonal structures, fitted to temperature on the calendar
+# date alone (no history or weather predictors).
+structure_fits <- list(
+  shared = lm(temperature ~ airport + sin1 + cos1 + sin2 + cos2,
+              data = seasonal_data),
+  airport1 = lm(temperature ~ airport * (sin1 + cos1) + sin2 + cos2,
+                data = seasonal_data),
+  airport2 = lm(temperature ~ airport * (sin1 + cos1 + sin2 + cos2),
+                data = seasonal_data)
+)
+curve_grid <- expand.grid(
+  airport = names(example_airports), day = 1:365,
+  stringsAsFactors = FALSE
+) %>%
+  mutate(
+    sin1 = sin(omega * day), cos1 = cos(omega * day),
+    sin2 = sin(2 * omega * day), cos2 = cos(2 * omega * day)
+  )
+fitted_curves <- bind_rows(lapply(names(structure_fits), function(name) {
+  mutate(curve_grid, structure = name,
+         temperature = predict(structure_fits[[name]], curve_grid))
+})) %>%
+  mutate(
+    structure = factor(structure, levels = names(structure_fits)),
+    airport = factor(example_airports[airport], levels = example_airports)
+  )
+daily_normals <- seasonal_data %>%
+  filter(airport %in% names(example_airports), day <= 365) %>%
+  group_by(airport, day) %>%
+  summarise(temperature = mean(temperature), .groups = "drop") %>%
+  mutate(airport = factor(example_airports[airport], levels = example_airports))
+ggplot(daily_normals, aes(day, temperature)) +
+  geom_point(color = "grey65", size = 0.5) +
+  geom_line(aes(color = structure, linetype = structure),
+            data = fitted_curves, linewidth = 0.8) +
+  facet_wrap(~ airport, nrow = 1) +
+  scale_color_manual(
+    values = c(shared = "#eb6834", airport1 = "#1baf7a", airport2 = "#2a78d6"),
+    name = "Seasonal structure"
+  ) +
+  scale_linetype_manual(
+    values = c(shared = "longdash", airport1 = "solid", airport2 = "22"),
+    name = "Seasonal structure"
+  ) +
+  scale_x_continuous(breaks = month_starts, labels = month_labels,
+                     expand = c(0.01, 0)) +
+  labs(x = "Month", y = "Daily mean temperature (°F)") +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank(),
+        strip.text = element_text(face = "bold"),
+        legend.position = "bottom")
+```
+
+All coefficients are specific to the horizon \(l\). The models are
+fitted to data from all airports; forecasts are evaluated at the 15
+target airports.
+
+### Estimation
+
+For each horizon the coefficients are estimated by ordinary least
+squares,
+
+\[
+\min_{\beta_0,\boldsymbol\beta}\;
+\sum_{i=1}^{n}
+\bigl(y_i-\beta_0-\mathbf x_i^\top\boldsymbol\beta\bigr)^2,
+\]
+
+where \(\mathbf x_i\) collects the predictors of the forecasting
+model for training observation \(i\). No shrinkage is applied: each
+fit uses about 250,000 training observations and a few hundred
+coefficients, so the complexity of the model is controlled through
+the choice of \(h\) and of the seasonal structure.
+
+### Outliers and Missing Values
+
+Outlier removal is part of the cross-validation and is repeated for
+each held-out year.
+
+1. **Rule.** For each airport and each of the three temperature
+   variables, compute the quartiles \(Q_1\) and \(Q_3\) from the
+   training years only. Any value outside
+   \[
+   \bigl[\,Q_1-3\,(Q_3-Q_1),\; Q_3+3\,(Q_3-Q_1)\,\bigr]
+   \]
+   is set to missing, in the training years and in the held-out year
+   alike. The held-out year therefore never influences its own
+   cutoffs. Other weather variables are not screened.
+
+2. **Other missing values.** Precipitation recorded as trace (`T`)
+   or blank is treated as missing. A blank event category means no
+   event.
+
+3. **Training observations.** An observation is used to fit horizon
+   \(l\) only if its target \(y_{a,t+l}\), all weather predictors on
+   day \(t\), and all \(h\) history values are present.
+
+4. **Forecast origins.** To keep each forecast within one calendar
+   year, an origin \(t\) is eligible only if \(d_t\ge 15\) and day
+   \(t+5\) falls in the same year. A held-out origin is scored only
+   if every weather predictor on day \(t\), the 15 most recent
+   temperatures \(y_{a,t},\ldots,y_{a,t-14}\), and all five targets
+   \(y_{a,t+1},\ldots,y_{a,t+5}\) are present and not flagged as
+   outliers. This set does not depend on the candidate model, so all
+   candidates are compared on identical origins.
+
+Because flagged days are excluded from scoring as well as fitting,
+the reported errors describe forecasts for non-outlier sequences.
+
+### Joint Cross-Validation
+
+A candidate is a pair \((m,h)\): a seasonal structure
+\(m\in\{\text{none},\text{shared},\text{airport1},\text{airport2}\}\)
+and a history length \(h\in\{0,1,\ldots,15\}\). This gives
+\(4\times16=64\) candidates per outcome.
+
+1. Divide the data into ten folds by calendar year, 2005 to 2014,
+   and hold out each year in turn.
+
+2. Using the other nine years, apply the outlier rule and, for every
+   candidate, fit the five horizon models. Training uses the actual
+   temperatures as history inputs. The outlier cutoffs and the
+   categorical levels are determined from the training years only.
+
+3. At each eligible origin in the held-out year, generate the five
+   forecasts sequentially, using observed temperatures up to the
+   origin and forecasts thereafter.
+
+4. Pool the squared errors over held-out years, origins, target
+   airports, and horizons:
+   \[
+   \operatorname{CV\text{-}MSE}(m,h)
+   =
+   \frac{1}{5N}
+   \sum_{(a,t)}\sum_{l=1}^{5}
+   \bigl(y_{a,t+l}-\widehat y_{a,t+l}^{(m,h)}\bigr)^2,
+   \]
+   where the outer sum is over the \(N\) scored origins.
+
+5. Select
+   \[
+   (m^*,h^*)
+   =
+   \arg\min_{m,h}\operatorname{CV\text{-}MSE}(m,h),
+   \]
+   breaking ties in favor of the simpler seasonal structure, then
+   the shorter history.
+
+6. Refit the five horizon models on all ten years with
+   \((m^*,h^*)\).
+
+The result is three forecasting systems, each containing five
+jointly selected models. We plot \(\operatorname{CV\text{-}MSE}\)
+against \(h\) for each seasonal structure, and report the error of the selected system at
+each horizon to show how it accumulates.
+
+## Model Selection
+
+The code below carries out the procedure of the previous section. It
+is shown for reference and is not run when this document is knitted:
+the full search fits \(3\times10\times64\times5=9{,}600\) regressions
+on about 250,000 observations each. The results reported in the next
+section were computed on the Great Lakes cluster with
+`model_selection.R`, which performs the same steps but saves each fit
+separately so that the fits can run in parallel. As a check, the
+code below was run for one fold (daily mean temperature, 2010 held
+out) and three candidates, and it reproduced the cluster's squared
+errors to rounding error.
+
+### Settings
+
+```{r ms-settings, eval=FALSE}
+outcomes <- c("Max.TemperatureF", "Mean.TemperatureF", "Min.TemperatureF")
+
+target_airports <- c(
+  "ABQ", "ATL", "BOS", "DEN", "DFW", "DLH", "DTW", "EYW",
+  "IAD", "LAN", "LAX", "SEA", "SFO", "SLC", "TVC"
+)
+
+years <- 2005:2014
+history_grid <- 0:15
+max_history <- max(history_grid)
+
+# The four seasonal structures, written as model-formula terms.
+harmonics <- "sin1 + cos1 + sin2 + cos2"
+
+seasonal_terms <- c(
+  none     = NA,
+  shared   = harmonics,
+  airport1 = paste(harmonics, "+ airport:sin1 + airport:cos1"),
+  airport2 = paste(harmonics, "+ airport:sin1 + airport:cos1",
+                   "+ airport:sin2 + airport:cos2")
+)
+```
+
+### Data
+
+`weather_long` is the long-format data from Section 2, with one row
+per airport and day.
+
+```{r ms-data, eval=FALSE}
+omega <- 2 * pi / 365.25
+
+weather_data <- weather_long %>%
+  arrange(airport, date) %>%
+  mutate(
+    year = as.integer(format(date, "%Y")),
+    day = as.integer(format(date, "%j")),
+    wind_sin = sin(WindDirDegrees * pi / 180),
+    wind_cos = cos(WindDirDegrees * pi / 180),
+    sin1 = sin(omega * day),
+    cos1 = cos(omega * day),
+    sin2 = sin(2 * omega * day),
+    cos2 = cos(2 * omega * day),
+    Events = trimws(as.character(Events)),
+    Events = ifelse(Events == "", "None", Events)  # blank = no event
+  )
+
+# Weather predictors: every numeric variable except bookkeeping
+# columns, raw wind direction and the seasonal terms.
+weather_variables <- weather_data %>%
+  select(where(is.numeric)) %>%
+  names() %>%
+  setdiff(c("year", "day", "WindDirDegrees",
+            "sin1", "cos1", "sin2", "cos2"))
+```
+
+### Outlier Rule
+
+```{r ms-outliers, eval=FALSE}
+# Set temperatures outside the 3 x IQR fences to missing. The
+# quartiles are computed per airport from the training years only;
+# the fences are then applied to every year.
+remove_outliers <- function(data, held_out_year = NULL) {
+
+  screen <- function(x, year) {
+    training <- if (is.null(held_out_year)) x else x[year != held_out_year]
+    q <- quantile(training, c(0.25, 0.75), na.rm = TRUE)
+    fence <- 3 * (q[2] - q[1])
+    ifelse(x < q[1] - fence | x > q[2] + fence, NA, x)
+  }
+
+  data %>%
+    group_by(airport) %>%
+    mutate(across(all_of(outcomes), ~ screen(.x, year))) %>%
+    ungroup()
+}
+```
+
+### Training Tables
+
+```{r ms-tables, eval=FALSE}
+# Value of x k days later (k > 0) or -k days earlier (k < 0).
+shift <- function(x, k) if (k >= 0) lead(x, k) else lag(x, -k)
+
+# One row per airport and origin day t, for forecast horizon l:
+#   response   = temperature on day t + l
+#   history_j  = temperature on day t + l - j   (j days before the target)
+#   observed_j = temperature on day t - j + 1   (known at the origin)
+make_table <- function(data, outcome, l) {
+
+  data <- data %>%
+    group_by(airport) %>%
+    mutate(response = lead(.data[[outcome]], l))
+
+  for (j in 1:max_history) {
+    data <- data %>%
+      mutate(
+        "history_{j}" := shift(.data[[outcome]], l - j),
+        "observed_{j}" := lag(.data[[outcome]], j - 1)
+      )
+  }
+
+  # Keep each forecast sequence within one calendar year.
+  data %>%
+    ungroup() %>%
+    filter(
+      day >= max_history,
+      as.integer(format(date + 5, "%Y")) == year
+    )
+}
+```
+
+### Model and Sequential Forecasts
+
+Each horizon model is fitted by ordinary least squares with `lm()`.
+
+```{r ms-model, eval=FALSE}
+# Formula of the model with history length h and a seasonal structure.
+model_formula <- function(h, seasonal, predictors) {
+
+  terms <- c(
+    if (h > 0) paste0("history_", 1:h),
+    predictors,
+    "airport",
+    "Events",
+    na.omit(seasonal_terms[[seasonal]])
+  )
+
+  reformulate(terms, response = "response")
+}
+
+# Five forecasts from each origin, made one day at a time. A history
+# value after the origin is replaced by its forecast.
+forecast_sequence <- function(models, origins, h) {
+
+  forecasts <- matrix(NA_real_, nrow(origins), 5)
+
+  for (l in 1:5) {
+
+    newdata <- origins
+
+    for (j in seq_len(h)) {
+      newdata[[paste0("history_", j)]] <-
+        if (l - j > 0) {
+          forecasts[, l - j]                        # day t + l - j is in the future
+        } else {
+          origins[[paste0("observed_", j - l + 1)]]  # already observed
+        }
+    }
+
+    forecasts[, l] <- predict(models[[l]], newdata)
+  }
+
+  forecasts
+}
+```
+
+### One Cross-Validation Fold
+
+```{r ms-fold, eval=FALSE}
+all_candidates <- expand.grid(
+  h = history_grid,
+  seasonal = names(seasonal_terms),
+  stringsAsFactors = FALSE
+)
+
+# Squared forecast errors in one held-out year, for every candidate.
+cv_one_fold <- function(outcome, held_out_year,
+                        candidates = all_candidates) {
+
+  predictors <- setdiff(weather_variables, outcome)
+
+  cleaned <- remove_outliers(weather_data, held_out_year)
+  tables <- lapply(1:5, function(l) make_table(cleaned, outcome, l))
+
+  # The five tables have the same rows; only the columns differ.
+  is_training <- tables[[1]]$year != held_out_year
+  is_origin <- !is_training & tables[[1]]$airport %in% target_airports
+
+  # Event categories are learned from the training years.
+  event_levels <- sort(unique(na.omit(tables[[1]]$Events[is_training])))
+
+  training <- lapply(tables, function(table) {
+    table[is_training, ] %>%
+      mutate(Events = factor(Events, levels = event_levels))
+  })
+
+  # Origins to score: complete weather, 15 observed temperatures and
+  # all five targets. This set is the same for every candidate.
+  origins <- tables[[1]][is_origin, ]
+  targets <- sapply(tables, function(table) table$response[is_origin])
+
+  complete <- complete.cases(
+    origins[, c("Events", predictors, paste0("observed_", 1:max_history))],
+    targets
+  )
+
+  origins <- origins[complete, ]
+  targets <- targets[complete, ]
+
+  # An event category not seen in training is treated as the
+  # reference category.
+  origins$Events[!origins$Events %in% event_levels] <- event_levels[1]
+  origins$Events <- factor(origins$Events, levels = event_levels)
+
+  results <- lapply(seq_len(nrow(candidates)), function(i) {
+
+    h <- candidates$h[i]
+    seasonal <- candidates$seasonal[i]
+
+    # lm() drops training rows with a missing response or predictor.
+    models <- lapply(1:5, function(l) {
+      lm(model_formula(h, seasonal, predictors),
+         data = training[[l]], model = FALSE)
+    })
+
+    forecasts <- forecast_sequence(models, origins, h)
+
+    data.frame(
+      outcome = outcome,
+      year = held_out_year,
+      seasonal = seasonal,
+      h = h,
+      horizon = 1:5,
+      sse = colSums((targets - forecasts)^2),
+      n = nrow(targets)
+    )
+  })
+
+  bind_rows(results)
+}
+```
+
+### Cross-Validation and Selection
+
+```{r ms-select, eval=FALSE}
+cv_results <- bind_rows(lapply(outcomes, function(outcome) {
+  bind_rows(lapply(years, function(year) cv_one_fold(outcome, year)))
+}))
+
+# Pool the squared errors over years, origins, airports and horizons.
+cv_summary <- cv_results %>%
+  mutate(seasonal = factor(seasonal, levels = names(seasonal_terms))) %>%
+  group_by(outcome, seasonal, h) %>%
+  summarise(cv_mse = sum(sse) / sum(n), .groups = "drop")
+
+# Smallest CV-MSE; ties go to the simpler structure, then the shorter h.
+best_settings <- cv_summary %>%
+  arrange(outcome, cv_mse, seasonal, h) %>%
+  group_by(outcome) %>%
+  slice_head(n = 1) %>%
+  ungroup()
+```
+
+### Refit on All Years
+
+```{r ms-refit, eval=FALSE}
+# Refit the selected model on all ten years (outlier fences from all
+# years). Returns the five horizon models of one outcome.
+refit <- function(outcome, seasonal, h) {
+
+  predictors <- setdiff(weather_variables, outcome)
+  cleaned <- remove_outliers(weather_data)
+
+  lapply(1:5, function(l) {
+    lm(model_formula(h, seasonal, predictors),
+       data = make_table(cleaned, outcome, l), model = FALSE)
+  })
+}
+
+final_models <- lapply(seq_len(nrow(best_settings)), function(i) {
+  refit(
+    best_settings$outcome[i],
+    as.character(best_settings$seasonal[i]),
+    best_settings$h[i]
+  )
+})
+```
+
+## Results
+
+```{r results-load, echo=FALSE}
+results_directory <- "weather_selection_ols_h15_iqr3_v1"
+
+best_settings <- read.csv(file.path(results_directory, "best_settings.csv"))
+horizon_performance <- read.csv(
+  file.path(results_directory, "horizon_performance.csv")
+)
+final_models <- readRDS(file.path(results_directory, "final_models.rds"))
+
+outcome_labels <- c(
+  Max.TemperatureF = "Daily maximum",
+  Mean.TemperatureF = "Daily mean",
+  Min.TemperatureF = "Daily minimum"
+)
+
+selected <- best_settings %>%
+  mutate(
+    label = outcome_labels[outcome],
+    rmse = sqrt(cv_mse)
+  )
+
+selected_h <- setNames(selected$h, selected$outcome)
+selected_mse <- setNames(round(selected$cv_mse, 2), selected$outcome)
+```
+
+### Selected Models
+
+Cross-validation selects the richest seasonal structure, *airport2*
+(an airport-specific first and second harmonic), for all three
+outcomes. The selected history length is
+\(h=`r selected_h[["Max.TemperatureF"]]`\) days for the daily
+maximum, \(h=`r selected_h[["Mean.TemperatureF"]]`\) for the daily
+mean, and \(h=`r selected_h[["Min.TemperatureF"]]`\) for the daily
+minimum.
+
+```{r results-selected, echo=FALSE}
+selected %>%
+  transmute(
+    Outcome = label,
+    `Seasonal structure` = seasonal,
+    `History length h` = h,
+    `Forecasts scored` = format(n, big.mark = ","),
+    `CV-MSE` = round(cv_mse, 2),
+    `CV-RMSE` = round(rmse, 2)
+  ) %>%
+  knitr::kable(
+    align = "llrrrr",
+    caption = "Selected model for each outcome and its cross-validated error, pooled over the ten held-out years, the 15 target airports and the five horizons. MSE is in squared degrees Fahrenheit and RMSE in degrees Fahrenheit."
+  )
+```
+
+### Cross-Validated Error
+
+The estimated mean squared forecast error of the selected systems is
+`r selected_mse[["Max.TemperatureF"]]` for the daily maximum,
+`r selected_mse[["Mean.TemperatureF"]]` for the daily mean, and
+`r selected_mse[["Min.TemperatureF"]]` for the daily minimum, in
+squared degrees Fahrenheit. The error grows with the horizon, quickly
+from one to two days ahead and slowly afterwards.
+
+```{r results-horizon, echo=FALSE}
+horizon_performance %>%
+  mutate(Outcome = outcome_labels[outcome]) %>%
+  select(Outcome, horizon, mse) %>%
+  pivot_wider(
+    names_from = horizon,
+    values_from = mse,
+    names_prefix = "Day "
+  ) %>%
+  knitr::kable(
+    digits = 2,
+    caption = "Cross-validated MSE of the selected systems by forecast horizon."
+  )
+```
+
+### Final Models
+
+The selected models were refitted to all ten years, with the outlier
+fences computed from all years. Each of the 15 models has several
+hundred coefficients, most of them airport-specific, so we report
+the fit of each model and the coefficients that are common to all
+airports. The airport intercepts, the airport-specific seasonal
+coefficients and the event indicators are omitted from the tables;
+all coefficients are saved in `final_models.rds`.
+
+```{r results-fit, echo=FALSE}
+fit_summary <- bind_rows(lapply(names(final_models), function(outcome) {
+  bind_rows(lapply(1:5, function(l) {
+    model <- final_models[[outcome]]$horizons[[l]]
+    data.frame(
+      Outcome = outcome_labels[[outcome]],
+      Horizon = l,
+      Observations = format(model$n_training, big.mark = ","),
+      Coefficients = length(model$coefficients) - model$n_aliased,
+      `Residual SE` = model$details$sigma,
+      `R-squared` = model$details$r_squared,
+      check.names = FALSE
+    )
+  }))
+}))
+
+knitr::kable(
+  fit_summary,
+  digits = c(0, 0, 0, 0, 2, 3),
+  align = "lrrrrr",
+  caption = "Fit of the final models on all ten years. The residual standard error (degrees Fahrenheit) is an in-sample quantity; the forecast error is estimated by the cross-validated MSE."
+)
+```
+
+```{r results-coefficients, echo=FALSE, results="asis"}
+# Significance marks from the two-sided t-test of a zero coefficient.
+significance_marks <- function(estimate, std_error, df) {
+  p_value <- 2 * pt(-abs(estimate / std_error), df)
+  ifelse(p_value < 0.001, "***",
+  ifelse(p_value < 0.01, "**",
+  ifelse(p_value < 0.05, "*", "")))
+}
+
+# Estimate (standard error) for the coefficients shared by all airports.
+coefficient_table <- function(outcome) {
+
+  models <- final_models[[outcome]]$horizons
+
+  shared_names <- function(model) {
+    names(model$coefficients)[
+      !grepl("^(airport_|airportseason|event_)", names(model$coefficients))
+    ]
+  }
+
+  term_names <- unique(unlist(lapply(models, shared_names)))
+
+  cells <- sapply(models, function(model) {
+    estimate <- model$coefficients[term_names]
+    std_error <- model$details$std_errors[term_names]
+    marks <- significance_marks(
+      estimate, std_error, model$details$df_residual
+    )
+
+    text <- paste0(sprintf("%.3f (%.3f)", estimate, std_error), marks)
+
+    # Significant entries (p < 0.05) are printed in red (PDF output).
+    text <- ifelse(marks == "", text, paste0("\\textcolor{red}{", text, "}"))
+
+    ifelse(is.na(estimate), "", text)
+  })
+
+  labels <- term_names
+  labels <- sub("^history_(\\d+)$", "Temperature, lag \\1", labels)
+  labels <- sub("^season_(sin|cos)(\\d)$", "Harmonic \\2, \\1", labels)
+  labels <- sub("^wind_(sin|cos)$", "Wind direction, \\1", labels)
+  labels[labels == "(Intercept)"] <- "Intercept"
+
+  # Shorter names for the weather variables.
+  labels <- sub("Sea\\.Level\\.PressureIn$", "pressure", labels)
+  labels <- sub("(F|In|Miles|MPH)$", "", labels)
+  labels <- gsub(".", " ", labels, fixed = TRUE)
+  labels <- sub("MeanDew", "Mean Dew", labels)
+  labels <- sub("Dewpoint", "Dew Point", labels)
+
+  table <- data.frame(Term = labels, cells, check.names = FALSE)
+  names(table)[-1] <- paste("Day", 1:5)
+  rownames(table) <- NULL
+  table
+}
+
+# The tables are written as LaTeX so that the colour is kept and the
+# five columns fit the page width.
+for (outcome in names(final_models)) {
+
+  caption <- paste0(
+    outcome_labels[[outcome]],
+    " temperature: coefficients of the final models by forecast horizon, ",
+    "with standard errors in parentheses. Entries significant at the 0.05 ",
+    "level (t-test of a zero coefficient) are in red: ",
+    "* $p<0.05$, ** $p<0.01$, *** $p<0.001$."
+  )
+
+  tabular <- knitr::kable(
+    coefficient_table(outcome),
+    format = "latex",
+    escape = FALSE,
+    align = "lrrrrr",
+    linesep = ""
+  )
+
+  cat(
+    "\\begin{table}[!htbp]",
+    "\\centering",
+    paste0("\\caption{", caption, "}"),
+    "\\footnotesize",
+    "\\setlength{\\tabcolsep}{3pt}",
+    tabular,
+    "\\end{table}",
+    "",
+    sep = "\n"
+  )
+}
+```
+
+For the horizon \(l\) model, "temperature, lag \(j\)" is the
+outcome \(j\) days before the target day, that is, on day
+\(t+l-j\); in forecasting it is an observed value when \(j\ge l\)
+and a forecast otherwise. Pressure is
+sea-level pressure in inches. The intercept and the
+harmonic coefficients shown apply to the reference airport, and the other
+airports have their own deviations from them. The standard errors
+and significance marks are the usual least-squares ones and assume
+independent errors; because daily temperatures are serially
+correlated, they understate the true uncertainty. With about
+275,000 observations per model, even very small coefficients are
+statistically significant, so the marks indicate which predictors
+are distinguishable from zero, not which ones matter for the
+forecast.
+
+### Forecasts and Observed Temperatures
+
+Figures \ref{fig:forecast-series} and \ref{fig:forecast-scatter}
+compare the forecasts of the final models with the observed
+temperatures at the 15 target airports. The forecasts are produced
+as in the cross-validation: from each origin day, the five forecasts
+are made sequentially. Because the final models were fitted to these
+same ten years, the figures show the fit of the models and not
+their out-of-sample accuracy, which is estimated by the
+cross-validated MSE. The forecasts were computed once with
+`final_predictions.R` and are read from a saved file.
+
+```{r forecast-load, echo=FALSE}
+final_predictions <- readRDS(
+  file.path(results_directory, "final_predictions.rds")
+) %>%
+  mutate(
+    target_date = origin_date + horizon,
+    outcome_label = factor(
+      outcome_labels[outcome],
+      levels = outcome_labels
+    ),
+    horizon_label = paste(
+      horizon,
+      ifelse(horizon == 1, "day ahead", "days ahead")
+    )
+  )
+```
+
+```{r forecast-series, echo=FALSE, fig.width=10, fig.height=8.5, fig.cap="\\label{fig:forecast-series}Observed daily mean temperature in 2014 and the forecasts of the final model made one day and five days earlier, at four target airports. Gaps are days that were not scored because of missing values or flagged outliers."}
+series_airports <- c(
+  DLH = "Duluth (DLH)",
+  SLC = "Salt Lake City (SLC)",
+  SFO = "San Francisco (SFO)",
+  EYW = "Key West (EYW)"
+)
+
+series_data <- final_predictions %>%
+  filter(
+    outcome == "Mean.TemperatureF",
+    airport %in% names(series_airports),
+    horizon %in% c(1, 5),
+    format(target_date, "%Y") == "2014"
+  ) %>%
+  arrange(airport, horizon, target_date) %>%
+  group_by(airport, horizon) %>%
+  mutate(
+    # A new line segment starts after every gap in the scored days.
+    segment = cumsum(c(TRUE, diff(target_date) > 1))
+  ) %>%
+  ungroup() %>%
+  mutate(
+    airport_label = factor(
+      series_airports[airport],
+      levels = series_airports
+    )
+  ) %>%
+  pivot_longer(
+    cols = c(actual, predicted),
+    names_to = "series",
+    values_to = "temperature"
+  ) %>%
+  mutate(
+    series = factor(
+      series,
+      levels = c("actual", "predicted"),
+      labels = c("Observed", "Forecast")
+    )
+  )
+
+ggplot(
+  series_data,
+  aes(
+    target_date, temperature,
+    color = series, linewidth = series,
+    group = interaction(series, segment)
+  )
+) +
+  geom_line() +
+  geom_point(size = 0.3) +  # keeps isolated scored days visible
+  facet_grid(airport_label ~ horizon_label, scales = "free_y") +
+  scale_color_manual(
+    values = c(Observed = "grey35", Forecast = "#eb6834"),
+    name = NULL
+  ) +
+  scale_linewidth_manual(
+    values = c(Observed = 0.4, Forecast = 0.6),
+    name = NULL
+  ) +
+  scale_x_date(date_breaks = "2 months", date_labels = "%b") +
+  labs(x = "Target date (2014)", y = "Daily mean temperature (°F)") +
+  theme_bw() +
+  theme(
+    panel.grid.minor = element_blank(),
+    strip.text = element_text(face = "bold"),
+    legend.position = "bottom"
+  )
+```
+
+```{r forecast-scatter, echo=FALSE, fig.width=10, fig.height=5.8, fig.cap="\\label{fig:forecast-scatter}Forecast against observed temperature for the 15 final models, over all scored origins at the target airports from 2005 to 2014. Darker cells contain more forecasts; points on the diagonal line are exact forecasts."}
+ggplot(final_predictions, aes(actual, predicted)) +
+  geom_bin2d(bins = 70) +
+  geom_abline(slope = 1, intercept = 0, color = "#eb6834", linewidth = 0.5) +
+  facet_grid(outcome_label ~ horizon_label) +
+  scale_fill_gradient(
+    low = "#d6e6f8",
+    high = "#0f3d73",
+    trans = "log10",
+    name = "Forecasts\nper cell"
+  ) +
+  coord_equal() +
+  labs(x = "Observed temperature (°F)", y = "Forecast (°F)") +
+  theme_bw() +
+  theme(
+    panel.grid.minor = element_blank(),
+    strip.text = element_text(face = "bold")
+  )
+```
+
+In Figure \ref{fig:forecast-series} the one-day forecasts follow the
+day-to-day movements of the observed series, while the five-day
+forecasts stay close to the seasonal level and miss most short warm
+and cold spells. Figure \ref{fig:forecast-scatter} shows the same
+pattern for all 15 models: the forecasts lie along the diagonal at
+every horizon, and the spread around it widens from one to two days
+ahead and changes little afterwards. At the longer horizons the
+forecasts are pulled toward the seasonal level, so the coldest days
+are forecast too warm.

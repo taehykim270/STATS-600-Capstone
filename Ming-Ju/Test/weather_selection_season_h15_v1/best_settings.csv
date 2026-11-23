@@ -1,0 +1,4 @@
+"outcome","seasonal","h","penalty_index","relative_penalty","sse","n","cv_mse"
+"Max.TemperatureF","airport2",14,8,1e-05,11546364.3785358,205995,56.0516729946639
+"Mean.TemperatureF","airport2",15,8,1e-05,7800017.13583699,210720,37.0160266507071
+"Min.TemperatureF","airport2",13,8,1e-05,7490864.25829218,211145,35.4773461758137

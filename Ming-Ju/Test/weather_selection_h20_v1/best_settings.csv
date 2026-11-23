@@ -1,0 +1,4 @@
+"outcome","h","penalty_index","relative_penalty","sse","n","cv_mse"
+"Max.TemperatureF",16,8,0.001,13396315.157209,201655,66.4318522090153
+"Mean.TemperatureF",16,8,0.001,9238906.72123675,207215,44.5860903951777
+"Min.TemperatureF",13,8,0.001,8626483.77782753,207830,41.5074040216885

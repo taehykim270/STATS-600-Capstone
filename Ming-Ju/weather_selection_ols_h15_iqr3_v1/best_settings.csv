@@ -1,0 +1,4 @@
+"outcome","seasonal","h","sse","n","cv_mse"
+"Max.TemperatureF","airport2",14,12131421.3896888,214665,56.5132713282967
+"Mean.TemperatureF","airport2",13,7939965.7379784,214830,36.9592968299511
+"Min.TemperatureF","airport2",13,7677484.41974154,214700,35.7591263145857
