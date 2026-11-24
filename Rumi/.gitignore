@@ -1,0 +1,23 @@
+# Local historical experiments and the unfiltered original input
+/archive/
+/weather.rda
+
+# Rebuildable design matrix, C solver and R session files
+**/weather_preprocessed.rds
+*.o
+*.so
+*.dll
+*.dylib
+.Rhistory
+.RData
+.Rproj.user/
+
+# TeX build files and desktop metadata
+*.aux
+*.log
+*.out
+*.synctex.gz
+.DS_Store
+
+# Local editable model note
+airport_temperature_model_note.tex

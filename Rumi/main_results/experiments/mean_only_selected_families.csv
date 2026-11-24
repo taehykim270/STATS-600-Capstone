@@ -1,0 +1,8 @@
+"location","variable","nonzero","mean_per_fit"
+"external","Pressure",2665,11.8444444444444
+"local","Pressure",262,1.16444444444444
+"external","Pressure_change",3013,13.3911111111111
+"local","Tmax_anomaly",515,2.28888888888889
+"external","Tmean_anomaly",19341,85.96
+"local","Tmean_anomaly",184,0.817777777777778
+"local","Tmin_anomaly",488,2.16888888888889
