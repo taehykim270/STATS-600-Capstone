@@ -1,0 +1,805 @@
+---
+title: "Data Preprocessing: Weather Underground Airport Data (2005-2014)"
+format:
+  html:
+    toc: true
+editor: visual
+---
+
+# About this file
+
+**What this file does.** It cleans `weather.rda` and saves the result as `data.rda`. The analysis files only need to run `load("data.rda")`, which gives a data frame called `weather_clean`.
+
+**Where the data comes from.** Daily summaries from **Weather Underground** (wunderground.com) for 98 US airports, 2005-01-01 to 2014-12-31. Each airport has 22 daily variables (temperature, dew point, humidity, pressure, visibility, wind, precipitation, cloud cover, events).
+
+Weather Underground does not publish official definitions for these columns. When this file explains what a column means, that comes from standard NWS/ASOS (US airport weather station) reporting rules plus patterns we saw in the data. These are educated guesses, not official documentation.
+
+**Why we care.** The project goal is to predict daily Max/Mean/Min temperature for days 16-20 of each month, using days 1-15, for 15 target airports (MSE is the score). Temperature is the most important variable, but the other variables (and the other 83 airports) can be useful as predictors, so we clean everything.
+
+**Ground rules we followed.**
+
+1.  **A bad value becomes `NA`; we never delete rows.** Deleting a row because one column is wrong would also throw away the good values in the other columns on that day.
+2.  **If we can't tell which value is wrong**, we set all related columns to `NA` (for example, when Min \> Mean for temperature). **If we can tell**, we only set that one value to `NA` (for example, a pressure spike on the Max side only).
+3.  **Real extreme weather stays.** Hurricanes, record lows and floods are real, so we keep them even when they look like outliers.
+4.  **No `na.omit()` here.** Each analysis should drop `NA`s only for the columns it actually uses (`tidyr::drop_na(col1, col2, ...)`). The last section explains why.
+
+**How each section is organized.** For each variable: (1) a short explanation of what we found, what we decided, and the other options we considered, (2) a chunk that **only shows** the problem rows (nothing is changed there), and (3) a chunk that does the actual cleaning. If you disagree with a decision, look at the evidence chunk, change the rule in the cleaning chunk, and add a note.
+
+```{r}
+#| message: false
+
+library(tidyr)
+library(dplyr)
+library(stringr)
+library(skimr)
+
+# The 15 airports we have to predict (used only to check how issues affect them)
+target_airports <- c("ABQ", "ATL", "BOS", "DEN", "DFW", "DLH", "DTW", "EYW",
+                     "IAD", "LAN", "LAX", "SEA", "SFO", "SLC", "TVC")
+```
+
+# 0. Load and reshape
+
+**What we found.** `weather` is a wide data frame: 3,652 rows (one per day; the date is stored in the row names) and 2,156 columns (98 airports × 22 variables). Column names look like `DTW_Max.TemperatureF`. The dots come from R's `read.csv()`, which replaced the spaces in the original names.
+
+One annoying detail: `PrecipitationIn` does not have the same type at every airport. It is a factor at 87 airports, character at 7, and numeric at 4 (HFD, FOE, LCK, UNV). `Events` is a factor at 97 airports and character at TTN.
+
+**What we do.** We turn every `PrecipitationIn` and `Events` column into character first, so that all airports stack together cleanly. Then we reshape to long format: one row per airport per day (3,652 × 98 = 357,896 rows). We don't change any values in this step.
+
+```{r}
+load("weather.rda")
+
+dim(weather)
+
+# PrecipitationIn has different types at different airports
+weather |>
+  select(ends_with("_PrecipitationIn")) |>
+  sapply(class) |>
+  table()
+```
+
+```{r}
+weather_clean <- weather |>
+  tibble::rownames_to_column("date") |>
+  mutate(
+    date = as.Date(date),
+    # Make the mixed-type columns character so all airports stack together
+    across(ends_with("_PrecipitationIn"), as.character),
+    across(ends_with("_Events"), as.character)
+  ) |>
+  pivot_longer(
+    cols = -date,
+    names_to = c("airport", ".value"),
+    names_pattern = "^([A-Z]{3})_(.*)$"
+  ) |>
+  select(date, airport, everything())
+
+dim(weather_clean)            # should be 357896 x 24
+n_distinct(weather_clean$date) # 3652 days, no gaps
+```
+
+```{r}
+skim(weather_clean)
+```
+
+# 1. Events
+
+**What it is.** The weather phenomena seen that day, joined with `-` (for example `Fog-Rain-Thunderstorm`). There are 36 different combinations, all built from 6 basic events: Rain, Snow, Fog, Thunderstorm, Hail, Tornado.
+
+**What we found.**
+
+- `""` (blank) and `NA` mean different things. Blank (about 58% of days) means *nothing was reported*. `NA` (1,095 days) means *we don't know*.
+- All the `NA`s come from two blocks: **TTN 2005-2006** (730 days) and **ORD 2009** (365 days).
+- During those blocks, precipitation was still recorded, and some of those days were wet. So filling `NA` with "no event" would be wrong.
+
+**What we do.** We make 7 TRUE/FALSE columns: `ev_none` plus one column for each basic event (`ev_rain`, `ev_snow`, `ev_fog`, `ev_thunder`, `ev_hail`, `ev_tornado`). Then we drop `Events`. Nothing is lost, because the original string can be rebuilt from the 7 columns. `NA` days stay `NA` in all 7 columns.
+
+**Other options.**
+
+- *One dummy per combination (36 columns):* `Rain` and `Fog-Rain` would be treated as unrelated, and many combinations appear only a handful of times.
+- *Fill `NA` with FALSE:* wrong, because wet days in the gap would look like "nothing happened".
+- *Guess events from other columns (e.g. rain from precipitation):* possible for rain only. There's no basis for fog, thunder or hail, so we didn't do it.
+- *Note for modeling:* Hail and Tornado are very rare. You may want to drop them or merge them into Thunderstorm.
+
+```{r}
+# All event combinations and how often they appear
+weather_clean |> count(Events, sort = TRUE)
+
+# Where are the NAs?
+weather_clean |>
+  filter(is.na(Events)) |>
+  count(airport, year = format(date, "%Y"))
+
+# Precipitation was still recorded during the NA blocks
+weather_clean |>
+  filter(is.na(Events)) |>
+  summarise(
+    wet_days   = sum(!(PrecipitationIn %in% c("0", "0.00", "T", "")) & !is.na(PrecipitationIn)),
+    trace_days = sum(PrecipitationIn == "T", na.rm = TRUE)
+  )
+```
+
+```{r}
+weather_clean <- weather_clean |>
+  mutate(
+    ev_none    = Events == "",
+    ev_rain    = str_detect(Events, "Rain"),
+    ev_snow    = str_detect(Events, "Snow"),
+    ev_fog     = str_detect(Events, "Fog"),
+    ev_thunder = str_detect(Events, "Thunderstorm"),
+    ev_hail    = str_detect(Events, "Hail"),
+    ev_tornado = str_detect(Events, "Tornado")
+  ) |>
+  select(-Events)
+```
+
+# 2. PrecipitationIn
+
+**What it is.** Total precipitation for the day in inches, recorded in steps of 0.01. Snow counts as the water you'd get by melting it (this is not snow depth). `T` means **trace**: some precipitation fell, but less than 0.01 inch. So `T` is different from 0.
+
+We keep the amount as a number (`T` becomes 0) and add a new TRUE/FALSE column `Precipitation` for "did anything fall?" (`T` becomes TRUE). Use `PrecipitationIn` for totals and averages, and `Precipitation` for rainy-day counts.
+
+**What we found, and what we do.**
+
+1.  **4 blank values** (`""`) at OLM 2011-10-23, FLG 2013-08-01, RAP 2013-10-05 and 2013-10-06. These become `NA`. (They are also what caused the "NAs introduced by coercion" warning in `as.numeric()`.)
+
+2.  **MYR 2010-2014: only wet days are left.** From 2005 to 2009, MYR had about 260 dry days and 20 trace days a year. From 2010 on, it has **zero** dry days, **zero** trace days, and roughly 300 `NA` days a year. It looks like the dry and trace days were wiped out. Some wet days are probably missing too: 2010 has only 28 wet days, against about 87 in a normal year.
+
+    - *Why not just drop the `NA` rows?* Then only wet days would remain, and MYR would look like it rains every day.
+    - *Why not fill `NA` with 0?* Many of those `NA` days have Rain or Snow in Events, so they were not dry.
+    - **Decision:** set `PrecipitationIn` and `Precipitation` to `NA` for all of MYR 2010-2014. The rows stay, so the other variables can still be used.
+
+3.  **LCK reports 0.00 on every single day for 10 years**, even though Events shows Rain or Snow on 1,591 of those days. The column is clearly a placeholder. **Decision:** set LCK precipitation to `NA` for the whole period (same idea as MYR).
+
+4.  **CMI 2011-02-06 has 999 inches.** This is a missing-value code, not a measurement. **Decision:** any value of 999 or more becomes `NA`.
+
+5.  **At some airports and in some years, trace could not be recorded at all.**
+
+    - HFD, FOE and UNV (and LCK) store precipitation as numbers, so `T` could never appear.
+    - MOT, OAK, CMI, LAN, TVC and BMG (2005-2007) and LIT (2005) write `0` instead of `0.00` and never use `T` in those years.
+    - On those days, a trace day was written as 0. Evidence: only about 2% of `0.00` days have a Rain/Snow event, but about 23% of `0` days do (for comparison, 61% of `T` days do).
+    - So in those airport-years, `Precipitation` undercounts wet days. This touches two of our target airports: **LAN and TVC in 2005-2007**.
+    - The rule is easy to apply: in every other airport-year there are at least 8 `T` days, so "no `T` all year" cleanly picks out these cases.
+    - **Decision:** we keep the values and add a flag column `trace_recorded` (FALSE when that airport never recorded `T` that year). If your analysis depends on rainy-day counts, use `filter(trace_recorded)`.
+    - *Other options:* (a) set `Precipitation` to `NA` on zero days where trace couldn't be recorded. That's more strict, but it removes data for everyone, even analyses that don't care. (b) Do nothing and just document it. We went with the flag because it's cheap and leaves the choice to each analysis.
+
+6.  **Very large values (6-11 inches) are real.** Examples: the Nashville flood (BNA, 2010-05-01/02), Tropical Storm Lee (BHM/CHA, 2011-09-05), the Mobile flood (MOB, 2014-04-29) and the remnants of Hurricane Ike in Chicago (ORD, 2008-09-13). We keep them.
+
+```{r}
+# Temporary helper columns, for checking only
+precip_check <- weather_clean |>
+  mutate(
+    year   = format(date, "%Y"),
+    amount = suppressWarnings(as.numeric(PrecipitationIn))  # "T" and "" become NA here
+  )
+
+# Special codes: blank and NA
+precip_check |>
+  filter(is.na(PrecipitationIn) | PrecipitationIn == "") |>
+  count(airport, year)
+
+# MYR by year: dry / trace / wet / missing
+precip_check |>
+  filter(airport == "MYR") |>
+  group_by(year) |>
+  summarise(
+    dry     = sum(amount == 0, na.rm = TRUE),
+    trace   = sum(PrecipitationIn == "T", na.rm = TRUE),
+    wet     = sum(amount > 0, na.rm = TRUE),
+    missing = sum(is.na(PrecipitationIn))
+  )
+```
+
+```{r}
+# LCK: zero wet days but many rain/snow events
+precip_check |>
+  group_by(airport) |>
+  summarise(
+    wet_or_trace_days    = sum(amount > 0 | PrecipitationIn == "T", na.rm = TRUE),
+    rain_snow_event_days = sum(ev_rain | ev_snow, na.rm = TRUE)
+  ) |>
+  arrange(wet_or_trace_days) |>
+  head(5)
+
+# Largest values (999 is a code; the rest are real storms)
+precip_check |>
+  filter(amount > 6) |>
+  arrange(desc(amount)) |>
+  select(date, airport, PrecipitationIn, ev_rain, ev_thunder)
+```
+
+```{r}
+# Trace: airport-years with no "T" at all
+trace_by_year <- precip_check |>
+  group_by(airport, year) |>
+  summarise(n_trace = sum(PrecipitationIn == "T", na.rm = TRUE), .groups = "drop")
+
+trace_by_year |>
+  filter(n_trace == 0) |>
+  group_by(airport) |>
+  summarise(years_without_T = paste(year, collapse = ", "))
+
+# Smallest number of T days among the other airport-years (clear gap from 0)
+trace_by_year |>
+  filter(n_trace > 0) |>
+  arrange(n_trace) |>
+  head(5)
+
+# "0" days look like a mix of dry and trace days
+precip_check |>
+  filter(PrecipitationIn %in% c("0.00", "0", "T")) |>
+  group_by(code = PrecipitationIn) |>
+  summarise(days = n(),
+            share_with_rain_or_snow_event = mean(ev_rain | ev_snow, na.rm = TRUE))
+```
+
+```{r}
+weather_clean <- weather_clean |>
+  mutate(PrecipitationIn = na_if(PrecipitationIn, "")) |>
+  # Flag: did this airport record any "T" in this year?
+  group_by(airport, year = format(date, "%Y")) |>
+  mutate(trace_recorded = any(PrecipitationIn == "T", na.rm = TRUE)) |>
+  ungroup() |>
+  select(-year) |>
+  mutate(
+    # Did anything fall? (T counts as yes)
+    Precipitation = PrecipitationIn == "T" |
+      as.numeric(replace(PrecipitationIn, PrecipitationIn == "T", "0")) > 0,
+    # Amount in inches (T counts as 0)
+    PrecipitationIn = as.numeric(replace(PrecipitationIn, PrecipitationIn == "T", "0")),
+    # Unusable precipitation: MYR 2010+, LCK (all zeros), 999 code
+    precip_bad = (airport == "MYR" & date >= as.Date("2010-01-01")) |
+      airport == "LCK" |
+      PrecipitationIn >= 999,
+    across(c(PrecipitationIn, Precipitation),
+           \(x) replace(x, precip_bad %in% TRUE, NA))
+  ) |>
+  select(-precip_bad)
+```
+
+# 3. Max/Mean/Min.TemperatureF
+
+**What it is.** Daily maximum, mean and minimum temperature in °F. Mean is almost always (Max + Min) / 2: over 99% of days are within 1°F. This matters, because a wrong Max or Min usually drags the Mean with it.
+
+**What we found, and what we do.**
+
+1.  **Values above 1000 (3 rows: DEN, SLC, TUL).** They look like several numbers glued together (for example 54112, 621207). The first two digits fit the rest of that day perfectly: for DEN, Max 54 and Min 46 give (54 + 46) / 2 = 50, which is exactly the reported Mean. **Decision:** keep the first two digits.
+2.  **Out of range (4 rows).** We use Max \> 120°F, Min \> 100°F, Min \< -50°F. The hottest believable values in the data are 117-119°F at PHX and LAS. Right above that come BIS and MAF at 122°F (both about 40°F hotter than the days around them), MYR at 136°F in February, and MAF with Min -1000.
+3.  **Min ≤ Mean ≤ Max is broken (12 rows).** Examples: OLM with Mean 0 (Max 75, Min 51), RDU with Max 0. We can't tell which of the three is wrong.
+4.  **Known errors that pass the checks above (4 rows).** Because Mean is computed from Max and Min, a bad Max or Min can still satisfy Min ≤ Mean ≤ Max. We found these by looking at the largest daily ranges (Max - Min):
+    - CMI 2008-09-24: Min 0°F in September (Mean 42 = (84 + 0) / 2)
+    - CMI 2008-07-02: Min -1°F in July
+    - CMI 2009-01-19: Max 99°F in January
+    - TUS 2013-07-24: Min 26°F in July
+5.  **Max = 0°F is real.** It only shows up in winter at cold northern airports (MOT, BIS, DLH, FSD, ...). The one exception (RDU) is already caught by rule 3.
+
+**Decision.** For every row flagged in 2-4, set **all three** temperature columns to `NA` (20 rows in total). Because Mean is built from Max and Min, one bad value usually means the Mean is bad too.
+
+**Other options.**
+
+- *Set only the bad column to `NA`:* we'd still be left with a contaminated Mean.
+- *A general rule instead of a hand-made list, e.g. "Max - Min \> 65°F":* it catches the same 4 days without touching real cases (the largest real range we saw is BZN at 65°F). But a hand-made list is easier to read and to argue with. If the validation year shows similar errors, a general rule might be worth switching to.
+- *Impute (e.g. from nearby days):* we leave that to the modeling step.
+
+Note: the 15 target airports have almost no temperature `NA`s (a few days in total), so this step barely changes the target data.
+
+```{r}
+# (a) Values above 1000
+weather_clean |>
+  filter(Max.TemperatureF > 1000 | Min.TemperatureF > 1000) |>
+  select(date, airport, Max.TemperatureF, Mean.TemperatureF, Min.TemperatureF)
+
+# (b) Mean is (almost) the average of Max and Min
+weather_clean |>
+  filter(Max.TemperatureF < 1000, Min.TemperatureF < 1000) |>
+  summarise(share_within_1F = mean(
+    abs(Mean.TemperatureF - (Max.TemperatureF + Min.TemperatureF) / 2) <= 1,
+    na.rm = TRUE
+  ))
+```
+
+```{r}
+# (c) Extreme values (the 1000+ rows are excluded here)
+weather_clean |>
+  filter((Max.TemperatureF > 115 & Max.TemperatureF < 1000) | Min.TemperatureF < -40) |>
+  select(date, airport, Max.TemperatureF, Mean.TemperatureF, Min.TemperatureF) |>
+  arrange(desc(Max.TemperatureF))
+
+# (d) Min <= Mean <= Max is broken
+weather_clean |>
+  filter(Max.TemperatureF < 1000, Min.TemperatureF < 1000) |>
+  filter(Min.TemperatureF > Mean.TemperatureF | Mean.TemperatureF > Max.TemperatureF) |>
+  select(date, airport, Max.TemperatureF, Mean.TemperatureF, Min.TemperatureF)
+```
+
+```{r}
+# (e) Largest daily ranges: this is how we found the known errors
+weather_clean |>
+  filter(Max.TemperatureF < 1000, Min.TemperatureF < 1000, Min.TemperatureF > -1000) |>
+  mutate(daily_range = Max.TemperatureF - Min.TemperatureF) |>
+  arrange(desc(daily_range)) |>
+  select(date, airport, Max.TemperatureF, Mean.TemperatureF, Min.TemperatureF, daily_range) |>
+  head(10)
+
+# (f) Max = 0 happens only at cold northern airports
+weather_clean |>
+  filter(Max.TemperatureF == 0) |>
+  count(airport, sort = TRUE)
+```
+
+```{r}
+temp_cols <- c("Max.TemperatureF", "Mean.TemperatureF", "Min.TemperatureF")
+
+# Errors that pass the range and order checks (format: "airport date")
+temp_known_errors <- c(
+  "CMI 2008-09-24",  # Min 0F in September; Mean = (84 + 0) / 2
+  "CMI 2008-07-02",  # Min -1F in July
+  "CMI 2009-01-19",  # Max 99F in January
+  "TUS 2013-07-24"   # Min 26F in July
+)
+
+weather_clean <- weather_clean |>
+  mutate(
+    # 1) Larger than 1000 (DEN, SLC, TUL): keep the first two digits
+    across(c(Max.TemperatureF, Min.TemperatureF),
+           \(x) if_else(x > 1000, as.integer(substr(x, 1, 2)), x)),
+    # 2) Out of range, Min <= Mean <= Max broken, or a known error
+    temp_bad = Max.TemperatureF > 120 |
+      Min.TemperatureF > 100 | Min.TemperatureF < -50 |
+      Min.TemperatureF > Mean.TemperatureF |
+      Mean.TemperatureF > Max.TemperatureF |
+      paste(airport, date) %in% temp_known_errors,
+    # 3) Set all three temperature columns to NA for flagged rows (rows stay)
+    across(all_of(temp_cols), \(x) replace(x, temp_bad %in% TRUE, NA))
+  ) |>
+  select(-temp_bad)
+```
+
+# 4. Max/Mean/Min.DewPointF
+
+**What it is.** Daily max, mean and min dew point in °F. The original names don't match each other (`Max.Dew.PointF`, `MeanDew.PointF`, `Min.DewpointF`), so we rename them to `Max/Mean/Min.DewPointF`.
+
+**What we found.**
+
+- `NA` on 1,900 rows, always all three columns together. Most of them are the TTN and ORD gap periods.
+- Min ≤ Mean ≤ Max holds everywhere.
+- **Two impossible lows:** -135°F (UNV 2012-02-27) and -108°F (MCO 2010-01-09, in Florida). The next lowest value is around -38°F.
+- **Max dew point \> Max temperature.** This is physically impossible (dew point can't be higher than the air temperature). Small gaps of 1-2°F happen a lot and are probably just rounding or timing (Max temperature and Max dew point can come from different observations). **Gaps above 5°F (31 rows)** are treated as errors. Example: ABQ 2013-01-11, Max dew point 64 with Mean dew point 6 and Max temperature 42.
+
+**Decision.** If Min \< -60°F, or Max dew point \> Max temperature + 5°F, set all three dew point columns to `NA` (33 rows). One bad hourly reading can also pull the Mean, so we treat the three together. **This has to run after the temperature cleaning**, because it uses `Max.TemperatureF`.
+
+**Other options.**
+
+- *Set only the Max to `NA` for the "\> temperature" cases:* the Mean and Min often look fine (e.g. HOU 2006-10-19). This is a reasonable choice too; we went with all three to be safe.
+- *Also check Min dew point \> Min temperature:* we didn't. The Min temperature can be recorded between hourly reports, but dew point only comes from hourly reports, so small violations are normal. Over 2,500 rows break this, mostly by 1-2°F.
+- *Keep large daily swings (30°F+):* these show up in places like ABQ, AMA and AUS, where dry-line passages are common, so we keep them.
+
+```{r}
+# Lowest values
+weather_clean |>
+  arrange(Min.DewpointF) |>
+  select(date, airport, Max.Dew.PointF, MeanDew.PointF, Min.DewpointF) |>
+  head(5)
+
+# Max dew point above Max temperature: how big is the gap?
+weather_clean |>
+  mutate(gap = Max.Dew.PointF - Max.TemperatureF) |>
+  filter(gap > 0) |>
+  count(gap_size = if_else(gap > 5, "more than 5F", "1 to 5F"))
+
+weather_clean |>
+  filter(Max.Dew.PointF > Max.TemperatureF + 5) |>
+  select(date, airport, Max.Dew.PointF, MeanDew.PointF, Min.DewpointF,
+         Max.TemperatureF) |>
+  head(10)
+```
+
+```{r}
+dew_cols <- c("Max.DewPointF", "Mean.DewPointF", "Min.DewPointF")
+
+weather_clean <- weather_clean |>
+  rename(
+    Max.DewPointF  = Max.Dew.PointF,
+    Mean.DewPointF = MeanDew.PointF,
+    Min.DewPointF  = Min.DewpointF
+  ) |>
+  mutate(
+    dew_bad = Min.DewPointF < -60 |
+      Max.DewPointF > Max.TemperatureF + 5,
+    across(all_of(dew_cols), \(x) replace(x, dew_bad %in% TRUE, NA))
+  ) |>
+  select(-dew_bad)
+```
+
+# 5. Max/Mean/Min.Humidity
+
+**What it is.** Daily max, mean and min relative humidity (%).
+
+**What we found.**
+
+- **Humidity 0% is a fake value.** 56 rows have all three columns at 0 (mostly FSD and SUX, 20 rows each). On those days temperature and dew point look normal: for example CMI 2014-08-02 has temperature 70°F and dew point 60°F, which means humidity around 70%, not 0%. Two more rows have only Min = 0 (LGA 2011-08-02 in an August New York summer, and TUS 2014-04-10).
+- Real low values do exist: 1-3% at desert airports (LAS, TUS, PHX, ELP). So the rule should catch exactly 0, not "very low".
+- **Min ≤ Mean ≤ Max is broken on 12 rows.** Most of them are FSD/SUX with Min = 99% (for example 93 / 63 / 99).
+- Max = 100% is very common (fog, rain), which is normal.
+
+**Decision.** If Min = 0 or the order is broken, set all three columns to `NA` (70 rows).
+
+**Other options.** *Recompute humidity from temperature and dew point:* tempting, but the daily Mean temperature and Mean dew point are not computed the same way, so the result wouldn't match the reported Mean humidity. We left humidity as reported.
+
+```{r}
+# Humidity 0 while temperature and dew point look normal
+weather_clean |>
+  filter(Min.Humidity == 0) |>
+  select(date, airport, Max.Humidity, Mean.Humidity, Min.Humidity,
+         Mean.TemperatureF, Mean.DewPointF) |>
+  head(10)
+
+weather_clean |>
+  filter(Min.Humidity == 0) |>
+  count(all_three_zero = Max.Humidity == 0)
+
+# Very low but real values come from desert airports
+weather_clean |>
+  filter(Min.Humidity %in% 1:3) |>
+  count(airport, sort = TRUE) |>
+  head(5)
+
+# Order broken
+weather_clean |>
+  filter(Min.Humidity > Mean.Humidity | Mean.Humidity > Max.Humidity) |>
+  select(date, airport, Max.Humidity, Mean.Humidity, Min.Humidity)
+```
+
+```{r}
+hum_cols <- c("Max.Humidity", "Mean.Humidity", "Min.Humidity")
+
+weather_clean <- weather_clean |>
+  mutate(
+    # Humidity 0% is a placeholder for missing; also check Min <= Mean <= Max
+    hum_bad = Min.Humidity == 0 |
+      Min.Humidity > Mean.Humidity |
+      Mean.Humidity > Max.Humidity,
+    across(all_of(hum_cols), \(x) replace(x, hum_bad %in% TRUE, NA))
+  ) |>
+  select(-hum_bad)
+```
+
+# 6. Max/Mean/Min.Sea.Level.PressureIn
+
+**What it is.** Daily max, mean and min sea-level pressure in inches of mercury (inHg). Normal values are around 29.5-30.5.
+
+**What we found.**
+
+- No placeholder values, and Min ≤ Mean ≤ Max always holds. `NA` on 1,886 rows (all three together, same gap periods as dew point).
+- **Very low pressure can be real.** On 2012-10-29 (**Hurricane Sandy**), AIY, PHL and ILG show Min around 28.0-28.2. That's real.
+- But on the same day, those airports also show **Max above 31.1**, which is not real. A bad reading can show up right next to a real one.
+
+**How we tell real from fake.** The Mean is an average of many hourly readings, so one bad reading barely moves it. So:
+
+- If **only one side** (Max or Min) is far from the Mean, that side is a bad reading.
+- In a **real storm**, pressure changes a lot during the day, so **both** Max and Min end up far from the Mean.
+
+We define `up = Max - Mean` and `down = Mean - Min` (rounded to 2 decimals to avoid floating-point issues like 0.8499999). For 99.9% of days, both are below about 0.5.
+
+**Decision.** Only the bad side becomes `NA`; the Mean is kept.
+
+- Max → `NA` if `up > 0.85 & down < 0.3`, or `up > 1.5` (9 rows, including the three Sandy Max values)
+- Min → `NA` if `down > 0.85 & up < 0.3` (10 rows)
+
+**Judgment calls (feel free to disagree).** The cutoffs 0.85 and 0.3 were picked by looking at the data. A few days are borderline and were left alone: BUF 2009-02-09 (Min flagged, but 5 other airports also had big pressure swings that day, so it might be real), and AMA 2005-05-23 and CHS 2009-06-23 (both sides far from the Mean, so the rule doesn't fire, but nearby airports show no storm).
+
+```{r}
+slp_check <- weather_clean |>
+  mutate(
+    up   = round(Max.Sea.Level.PressureIn - Mean.Sea.Level.PressureIn, 2),
+    down = round(Mean.Sea.Level.PressureIn - Min.Sea.Level.PressureIn, 2)
+  )
+
+# Normal size of up / down
+slp_check |>
+  summarise(up_99.9pct   = quantile(up, 0.999, na.rm = TRUE),
+            down_99.9pct = quantile(down, 0.999, na.rm = TRUE))
+
+# Days where one side is far from the mean (one-sided = error, two-sided = storm)
+slp_check |>
+  filter(up > 0.85 | down > 0.85) |>
+  select(date, airport, Max.Sea.Level.PressureIn, Mean.Sea.Level.PressureIn,
+         Min.Sea.Level.PressureIn, up, down) |>
+  arrange(date)
+```
+
+```{r}
+weather_clean <- weather_clean |>
+  mutate(
+    slp_up   = round(Max.Sea.Level.PressureIn - Mean.Sea.Level.PressureIn, 2),
+    slp_down = round(Mean.Sea.Level.PressureIn - Min.Sea.Level.PressureIn, 2),
+    # One-sided spike = a single bad reading (real storms move both sides)
+    slp_max_bad = (slp_up > 0.85 & slp_down < 0.3) | slp_up > 1.5,
+    slp_min_bad = slp_down > 0.85 & slp_up < 0.3,
+    Max.Sea.Level.PressureIn = replace(Max.Sea.Level.PressureIn, slp_max_bad %in% TRUE, NA),
+    Min.Sea.Level.PressureIn = replace(Min.Sea.Level.PressureIn, slp_min_bad %in% TRUE, NA)
+  ) |>
+  select(-c(slp_up, slp_down, slp_max_bad, slp_min_bad))
+```
+
+# 7. Max/Mean/Min.VisibilityMiles
+
+**What it is.** Daily max, mean and min visibility in miles.
+
+**What we found.**
+
+- **10 means "10 miles or more".** Automated stations (ASOS) report anything 10 miles or above as 10. The share of values that are exactly 10: Max 97.7%, Mean 61.9%, Min 42.0%. So Max visibility carries almost no information, and Mean visibility is biased low.
+- **About 310 values are above 10** (11-20, mostly 15 and 20), almost all at MYR and UNV. Human observers report in bigger steps above 10 miles, so these are probably human observations rather than errors. They just don't match the other airports.
+- **0 is real.** Most days with Min visibility 0 also have Fog in Events. The original observations are fractions of a mile, so a stored 0 roughly means "under 1 mile".
+
+**Decision.** Cap all three columns at 10, so every airport uses the same scale.
+
+**Other options.** *Set values above 10 to `NA`:* that would throw away the fact that visibility was good that day. *Modeling tip:* because of the cap, a flag such as "Min visibility \< 1 mile" may be more useful than the raw numbers.
+
+```{r}
+vis_cols <- c("Max.VisibilityMiles", "Mean.VisibilityMiles", "Min.VisibilityMiles")
+
+# Values above 10, by airport
+weather_clean |>
+  filter(Max.VisibilityMiles > 10 | Mean.VisibilityMiles > 10 | Min.VisibilityMiles > 10) |>
+  count(airport, sort = TRUE)
+
+# Share of values exactly at 10
+weather_clean |>
+  summarise(across(all_of(vis_cols), \(x) mean(x == 10, na.rm = TRUE)))
+
+# Visibility 0 usually comes with fog
+weather_clean |>
+  filter(Min.VisibilityMiles == 0) |>
+  summarise(days = n(), share_with_fog = mean(ev_fog, na.rm = TRUE))
+```
+
+```{r}
+weather_clean <- weather_clean |>
+  mutate(
+    # ASOS reports 10+ miles as 10; cap human-observed values (11-20) the same way
+    across(all_of(vis_cols), \(x) pmin(x, 10L))
+  )
+```
+
+# 8. Max/Mean.Wind.SpeedMPH
+
+**What it is.** Daily maximum and mean sustained wind speed in mph. (Gusts are a separate column, see the next section.)
+
+**What we found.**
+
+- **Mean \> Max on 95 rows.** That's impossible, and we can't tell which one is wrong (for example BZN 2006-08-30: Mean 72, Max 31; BUF 2006-01-20: Mean 14, Max 0).
+- **Max is clearly wrong on 41 more rows:**
+  - Max above 75 mph (hurricane force) at inland airports: MCO 1000, OKC 241, TVC 230, FSD 217, and MYR at 117-139 several times. The strongest real wind in the data is EYW during **Hurricane Wilma** (2005-10-24): Max 67, Mean 58, gust 78.
+  - Max far above the gust (Max \> gust + 15 mph), e.g. DSM 2006-11-02 with Max 64 and gust 23. We only compare when the gust looks valid (between 1 and 99).
+- Real storms stay: Wilma (EYW, MIA, FLL), Katrina (MOB 2005-08-29), Ike (HOU 2008-09-13), Sandy (LGA 2012-10-29), the 2012 derecho (IAD 2012-06-29). Days with Max 55-70 mph usually have a gust that's even higher, which fits thunderstorms.
+- Max = Mean = 0 days are calm days and stay.
+
+**Decision.** Mean \> Max: both become `NA`. Max-only problems: only Max becomes `NA`, Mean stays (136 rows in total). **This has to run before the gust cleaning**, because both steps compare wind and gust.
+
+```{r}
+# Mean above Max
+weather_clean |>
+  filter(Mean.Wind.SpeedMPH > Max.Wind.SpeedMPH) |>
+  select(date, airport, Max.Wind.SpeedMPH, Mean.Wind.SpeedMPH, Max.Gust.SpeedMPH) |>
+  head(10)
+
+# Very high Max: where does real end and fake begin?
+weather_clean |>
+  filter(Max.Wind.SpeedMPH > 60) |>
+  select(date, airport, Max.Wind.SpeedMPH, Mean.Wind.SpeedMPH, Max.Gust.SpeedMPH) |>
+  arrange(desc(Max.Wind.SpeedMPH))
+
+# Max far above a valid gust
+weather_clean |>
+  filter(Max.Gust.SpeedMPH > 0, Max.Gust.SpeedMPH < 100,
+         Max.Wind.SpeedMPH > Max.Gust.SpeedMPH + 15) |>
+  select(date, airport, Max.Wind.SpeedMPH, Mean.Wind.SpeedMPH, Max.Gust.SpeedMPH)
+```
+
+```{r}
+weather_clean <- weather_clean |>
+  mutate(
+    # Mean cannot exceed Max: unclear which is wrong -> both NA
+    wind_bad = Mean.Wind.SpeedMPH > Max.Wind.SpeedMPH,
+    # Max only: hurricane force at inland airports, or far above a valid gust
+    wind_max_bad = Max.Wind.SpeedMPH > 75 |
+      (Max.Gust.SpeedMPH > 0 & Max.Gust.SpeedMPH < 100 &
+         Max.Wind.SpeedMPH > Max.Gust.SpeedMPH + 15),
+    Max.Wind.SpeedMPH  = replace(Max.Wind.SpeedMPH, (wind_bad | wind_max_bad) %in% TRUE, NA),
+    Mean.Wind.SpeedMPH = replace(Mean.Wind.SpeedMPH, wind_bad %in% TRUE, NA)
+  ) |>
+  select(-wind_bad, -wind_max_bad)
+```
+
+# 9. Max.Gust.SpeedMPH
+
+**What it is.** In this data, it behaves like **the strongest wind of the day (peak gust)**, not like the strict airport definition, where a gust is only reported when the wind jumps by 10+ knots. Evidence: it has a value on about 93% of days, it's almost always at or above Max wind speed, and the median difference is only about 5 mph.
+
+**What we found.**
+
+- **`NA` on 23,270 rows (6.5%).** That's about 20% of days in 2005-2006 but only 2-3% from 2009 on, and up to about 38% at HFD and UNV. `NA` days tend to be calmer (lower Max wind speed). Max wind speed is still there on almost all of those days, so the station was working; only the gust value is missing.
+  - So `NA` does **not** mean "no wind", and it shouldn't be filled with 0. Filling with the average would also be biased, because `NA` days are calmer than average.
+- **Impossible values:** gust \> 100 mph (e.g. MCO 1000, several in the 230s). The strongest real gust in the data is about 99 mph at FLL during Wilma.
+- **Gust \> Max wind + 40 mph:** mostly at OAK, BTR, TLH and LIT (e.g. OAK 2012-05-13: wind 30, gust 83). Max wind is a 2-minute average at the hourly report, so a thunderstorm between reports can show up only in the gust. A 20-30 mph gap can be real, which is why we use a generous 40 mph cutoff.
+- **Gust = 0 while Max wind is not 0:** a placeholder. Gust = 0 with Max wind = 0 is a calm day and stays.
+
+**Decision.** Gust \> 100, gust \> Max wind + 40, or (gust = 0 and Max wind ≠ 0) → `NA` (439 rows). After this, about 6.6% of gust values are `NA`.
+
+**Should we use this variable?** In the first draft we planned to leave it out of the models because of the `NA` pattern. We still **keep the cleaned column in `data.rda`** so nobody has to redo the work. If you use it, remember that it has the most `NA`s of any column, and those `NA`s are concentrated in 2005-2006 and on calm days.
+
+```{r}
+# NA share by year
+weather_clean |>
+  group_by(year = format(date, "%Y")) |>
+  summarise(share_NA = mean(is.na(Max.Gust.SpeedMPH)))
+
+# NA days are calmer, but Max wind is still recorded
+weather_clean |>
+  group_by(gust_missing = is.na(Max.Gust.SpeedMPH)) |>
+  summarise(days = n(),
+            median_max_wind = median(Max.Wind.SpeedMPH, na.rm = TRUE),
+            max_wind_also_NA = sum(is.na(Max.Wind.SpeedMPH)))
+
+# Impossible or too-large values
+weather_clean |>
+  filter(Max.Gust.SpeedMPH > 100 | Max.Gust.SpeedMPH > Max.Wind.SpeedMPH + 40) |>
+  count(airport, sort = TRUE) |>
+  head(10)
+
+# Gust = 0: calm day or placeholder?
+weather_clean |>
+  filter(Max.Gust.SpeedMPH == 0) |>
+  count(max_wind_is_zero = Max.Wind.SpeedMPH %in% 0)
+```
+
+```{r}
+weather_clean <- weather_clean |>
+  mutate(
+    gust_bad = Max.Gust.SpeedMPH > 100 |
+      Max.Gust.SpeedMPH > Max.Wind.SpeedMPH + 40 |
+      (Max.Gust.SpeedMPH == 0 & !(Max.Wind.SpeedMPH %in% 0)),
+    Max.Gust.SpeedMPH = replace(Max.Gust.SpeedMPH, gust_bad %in% TRUE, NA)
+  ) |>
+  select(-gust_bad)
+```
+
+# 10. CloudCover
+
+**What it is.** An integer from 0 to 8. It looks like **oktas** (the sky split into eighths: 0 = clear, 8 = overcast). There's no official definition, but it fits Events well: the average is lowest on days with no events and highest on rain and snow days.
+
+**What we found.**
+
+- Two impossible values: -398 and -393.
+- **0 doesn't always mean clear.** Automated sensors only see clouds below about 12,000 ft. Some days have rain but CloudCover 0 (high-based showers at TUS, RAP, MAF, ...), and the share of 0 days varies a lot by airport (about 70% at TUS vs. only a few percent at DEN or DTW). Comparing raw values across airports is risky; compare within an airport, or use airport effects in the model.
+
+**Decision.** Anything outside 0-8 → `NA` (2 rows).
+
+```{r}
+weather_clean |> count(CloudCover)
+
+# Share of 0 differs a lot by airport
+cloud_zero <- weather_clean |>
+  group_by(airport) |>
+  summarise(share_zero = mean(CloudCover == 0, na.rm = TRUE)) |>
+  arrange(desc(share_zero))
+head(cloud_zero, 3)
+tail(cloud_zero, 3)
+
+# Rain days with CloudCover 0
+weather_clean |>
+  filter(CloudCover == 0, Precipitation %in% TRUE) |>
+  count(airport, sort = TRUE) |>
+  head(5)
+```
+
+```{r}
+weather_clean <- weather_clean |>
+  mutate(CloudCover = replace(CloudCover, !(CloudCover %in% 0:8), NA))
+```
+
+# 11. WindDirDegrees
+
+**What it is.** The wind direction for the day in degrees (0-360). 0 and 360 both mean north.
+
+**What we found.**
+
+- **-1 is a missing-value code (1,813 rows).** Almost all of them are at ORD (892) and TTN (871), inside those airports' gap periods. Wind speed on those days looks normal, so they weren't calm days.
+- Direction is a **circle**: 359° and 1° are only 2° apart, but as plain numbers they look 358 apart.
+
+**Decision.** -1 → `NA`. We also add `wind_dir_sin` and `wind_dir_cos`, which describe the direction without that wrap-around problem; those are the ones to put in a model. We keep the raw degrees too, for grouping into directions (N/E/S/W) or plotting.
+
+```{r}
+# Where is -1?
+weather_clean |>
+  filter(WindDirDegrees == -1) |>
+  count(airport, sort = TRUE) |>
+  head(5)
+
+# -1 days are not calm days
+weather_clean |>
+  group_by(dir_is_minus1 = WindDirDegrees == -1) |>
+  summarise(days = n(),
+            median_mean_wind = median(Mean.Wind.SpeedMPH, na.rm = TRUE))
+```
+
+```{r}
+weather_clean <- weather_clean |>
+  mutate(
+    # -1 is a missing code (mostly ORD/TTN gap periods), not calm days
+    WindDirDegrees = na_if(WindDirDegrees, -1L),
+    # Circular variable: use sin/cos in models instead of raw degrees
+    wind_dir_sin = sin(WindDirDegrees * pi / 180),
+    wind_dir_cos = cos(WindDirDegrees * pi / 180)
+  )
+```
+
+# 12. Final check and save
+
+**Column order.** We put the precipitation columns next to each other so the data is easier to read.
+
+**Why no `na.omit()`.** The chunk below shows how many rows `na.omit()` would remove. It's roughly 29,000 rows (about 8%). Most of them are lost because of a single column (mostly `Max.Gust.SpeedMPH`, then precipitation at MYR/LCK), even though everything else on those days is fine. And because gust `NA`s are concentrated on calm days and in 2005-2006, the rows that survive would be biased. Use `drop_na()` with only the columns you need:
+
+``` r
+load("data.rda")
+model_data <- weather_clean |>
+  drop_na(Max.TemperatureF, Mean.TemperatureF, Min.TemperatureF)
+```
+
+**Summary of changes**
+
+| Variable | What changed | How |
+|----|----|----|
+| Events | Turned into 7 TRUE/FALSE columns | 1,095 `NA` days stay `NA` |
+| PrecipitationIn | Blanks (4), MYR 2010-2014, all of LCK, one 999 | `NA`; new columns `Precipitation`, `trace_recorded` |
+| Temperature | 3 rows fixed (glued digits), 20 rows flagged | All three columns `NA` |
+| Dew point | 33 rows | All three columns `NA` |
+| Humidity | 70 rows | All three columns `NA` |
+| Sea-level pressure | Max 9, Min 10 | Only the bad side `NA` |
+| Visibility | About 310 values above 10 | Capped at 10 |
+| Wind speed | 95 rows (both) + 41 rows (Max only) | `NA` |
+| Gust | 439 rows | `NA` |
+| CloudCover | 2 rows | `NA` |
+| WindDirDegrees | 1,813 rows with -1 | `NA`; new sin/cos columns |
+
+The number of rows doesn't change: 357,896.
+
+```{r}
+weather_clean <- weather_clean |>
+  relocate(Precipitation, trace_recorded, .after = PrecipitationIn)
+
+dim(weather_clean)
+
+# NA count for every column
+colSums(is.na(weather_clean))
+
+# How many rows na.omit() would keep (just to show; we do NOT use it)
+nrow(weather_clean)
+nrow(na.omit(weather_clean))
+
+# Target airports: days with missing temperature
+weather_clean |>
+  filter(airport %in% target_airports) |>
+  group_by(airport) |>
+  summarise(temp_NA_days = sum(is.na(Mean.TemperatureF))) |>
+  filter(temp_NA_days > 0)
+```
+
+```{r}
+skim(weather_clean)
+```
+
+```{r}
+save(weather_clean, file = "data.rda")
+```
+
+# Open questions for the team
+
+Things we decided but that are worth a second look. Please add your opinion here.
+
+1.  **Applying this to the validation year.** We'll get new data for the validation year, and it needs the same cleaning. Should we wrap these steps into one function (e.g. `clean_weather(df)`)? Note that the hand-made error lists (temperature known errors, MYR, LCK) only apply to 2005-2014, while the general rules (ranges, order checks, -1 / 999 codes) will carry over.
+2.  **Dew point:** all three columns `NA`, or only Max, when Max dew point \> Max temperature + 5?
+3.  **Pressure borderline days** (BUF 2009-02-09, AMA 2005-05-23, CHS 2009-06-23): keep as is?
+4.  **Hail / Tornado dummies:** drop, or merge into Thunderstorm, for modeling?
+5.  **Gust:** use it as a predictor or not?
+6.  **`trace_recorded`:** does anyone's analysis need rainy-day counts at LAN/TVC in 2005-2007? If so, filter on this flag.

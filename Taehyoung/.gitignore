@@ -1,0 +1,4 @@
+# Rendering output and knitr cache (large, rebuilt by rendering analysis.qmd)
+analysis_cache/
+analysis_files/
+analysis.html

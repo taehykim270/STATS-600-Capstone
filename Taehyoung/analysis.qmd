@@ -1,0 +1,1586 @@
+---
+title: "Forecasting Airport Temperatures: How We Chose the Model"
+format:
+  html:
+    toc: true
+    number-sections: true
+editor: visual
+---
+
+# About this file
+
+**What this file does.** It builds the forecasting model one step at a time. Each section is one decision: what we tried, what we found, and why that led to the next step.
+
+**Input.** `data.rda`, made by `preprocess.qmd`. It holds `weather_clean`: one row per airport per day. Bad values are `NA`, and no rows were removed.
+
+**How each section is organized.** (1) Why we try this step. (2) The code. (3) The results, printed as tables and figures. (4) What we found, and what it tells us to do next.
+
+**Rendering time.** The first render takes about 20 minutes. Results are then cached in `analysis_cache/`, so later renders only rerun the chunks you changed (and the chunks that use their results). If `data.rda` or the coordinates file changes, everything reruns. The setup chunk below is not cached, so **if you change it, delete `analysis_cache/`** to force a full rerun.
+
+```{r}
+#| include: false
+#| cache: false
+
+knitr::opts_chunk$set(
+  cache = TRUE,
+  autodep = TRUE,
+  cache.extra = tools::md5sum(c("data.rda", "../Rumi/common_design/resources/coordinates.csv"))
+)
+```
+
+```{r}
+#| message: false
+#| cache: false
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(sandwich)  # robust standard errors
+library(lmtest)    # Wald tests
+library(glmnet)    # ridge, Lasso and elastic net
+library(parallel)  # fitting many models at once
+
+load("data.rda")
+
+# The 15 airports we have to forecast
+target_airports <- c("ABQ", "ATL", "BOS", "DEN", "DFW", "DLH", "DTW", "EYW",
+                     "IAD", "LAN", "LAX", "SEA", "SFO", "SLC", "TVC")
+
+# Colors for the methods in a figure (fixed order, never recycled)
+method_colors <- c("#2a78d6", "#eb6834", "#1baf7a")
+
+# Print a table with a caption
+show_table <- function(df, caption, digits = 1) {
+  knitr::kable(df, digits = digits, caption = caption,
+               format.args = list(big.mark = ",", nsmall = digits))
+}
+```
+
+# How every model is scored
+
+## The task
+
+In the validation year we get **days 1-15 of each month** and must forecast the daily max, mean and min temperature on **days 16-20** at the 15 target airports. That is 3 × 15 × 12 × 5 = 2,700 forecasts, scored by their mean squared error (MSE).
+
+## Two scores
+
+We use the words below for the rest of the file.
+
+-   **Start day:** the last day we can see. We forecast the 5 days after it.
+-   **Lead:** how many days after the start day we forecast (1 to 5).
+-   **Day-15 score:** the MSE when the start day is always the **15th** of the month. Inputs are days 1-15, targets are days 16-20. This is exactly how the validation year is scored: 2,700 forecasts per year, 27,000 over 2005-2014.
+-   **All-start-days score:** the MSE when **every day** of the year is used as a start day. The inputs are the 15 days ending on the start day, and the targets are the next 5 days. That is about 345 start days per year instead of 12, so about 30 times more forecasts.
+
+**Which one we use for what.**
+
+-   We **choose between models** with the **all-start-days score**. It measures the same thing (15 days in, the next 5 days out) with much less noise. The end of Step 1 shows how much less.
+-   We **report the day-15 score** as the number that matches the task.
+
+**Rules that keep the two scores honest.**
+
+1.  **A forecast may only use the 15 days up to the start day.** In the validation year we only get days 1-15 of each month, so nothing from earlier is available. A feature such as "the last 30 days" would look good here and then be impossible to compute for the validation year.
+2.  **The whole 20-day window (15 days in, 5 days out) must lie inside one calendar year.** So the first start day of a year is January 15 and the last is December 26. This keeps every window inside a single held-out year (see below).
+
+## Cross-validation: leave one year out, with a 30-day gap
+
+Methods with fitted coefficients are scored by **leaving one year out**:
+
+1.  Hold out one year (say 2010). Fit the model on the other years.
+2.  Forecast every start day in 2010 and record the errors.
+3.  Repeat for each of the ten years, then pool all the errors.
+
+**The 30-day gap.** Weather on December 31, 2009 is close to weather on January 1, 2010. If the late-December days were in training, the model would get a small preview of the held-out year. So when 2010 is held out, we **also drop the 30 days on each side of 2010 from training** (December 2-31, 2009 and January 1-30, 2011).
+
+-   The gap only removes days from **training**. All of 2010 is still **scored**, every month.
+-   Training keeps the Januaries and Decembers of the other eight years. Each fold loses about 2% of its training days.
+
+**Why whole years, and not only earlier years.** The validation year is described only as "a year other than 2005-2014", so it may come before or after our data. Average temperatures at the 15 airports show no trend over 2005-2014, so training on later years does not give an unfair advantage. For the final 2-3 candidates we will also check forward only (train on earlier years, test on later years) and backward only.
+
+**When two models are close.** Both models are scored on the same forecasts, so we look at the **difference** in all-start-days MSE, year by year. If the average difference is smaller than 2 standard errors of that difference, we treat the models as tied and keep the simpler one. The function `compare()` does this.
+
+## The code
+
+These objects and functions hold everything later sections need.
+
+| Object | One row per | What it holds |
+|---------------------|-----------------------|--------------------------|
+| `origins` | start day | the date, its year and month, and whether it is the 15th |
+| `inputs` | start day × airport × temperature type | the 15 known temperatures: `lag0` (the start day) to `lag14` (14 days before) |
+| `truth` | start day × airport × temperature type × lead | the temperature to be forecast (`actual`) |
+| `score()` | (function) | all-start-days MSE, its standard error, day-15 MSE and mean error |
+| `compare()` | (function) | MSE gain of a new model over a simpler one, its standard error, and the decision |
+
+Every method adds a column `pred` (its forecast) and a column `method` (its name) to `truth`, then calls `score()`.
+
+```{r}
+# Daily temperature at the 15 target airports, one row per airport, type and day
+temps <- weather_clean |>
+  filter(airport %in% target_airports) |>
+  select(date, airport,
+         Max  = Max.TemperatureF,
+         Mean = Mean.TemperatureF,
+         Min  = Min.TemperatureF) |>
+  pivot_longer(c(Max, Mean, Min), names_to = "target", values_to = "temp") |>
+  arrange(airport, target, date)
+
+year_of <- function(d) as.integer(format(d, "%Y"))
+
+# Start days: the whole window (14 days before to 5 days after) stays inside one year
+origins <- tibble(origin = sort(unique(temps$date))) |>
+  filter(year_of(origin - 14) == year_of(origin + 5)) |>
+  mutate(
+    year  = year_of(origin),
+    month = as.integer(format(origin, "%m")),
+    day15 = format(origin, "%d") == "15"
+  )
+
+# Known at the start day: lag0 = start day, ..., lag14 = 14 days before.
+# The dates have no gaps (3,652 days in a row), so a row shift is a day shift.
+inputs <- temps |> group_by(airport, target)
+for (k in 0:14) {
+  inputs <- inputs |> mutate("lag{k}" := lag(temp, k))
+}
+inputs <- inputs |>
+  ungroup() |>
+  select(-temp) |>
+  rename(origin = date) |>
+  semi_join(origins, by = "origin")
+
+# To be forecast: the temperature 1 to 5 days after the start day
+truth <- bind_rows(lapply(1:5, function(h) {
+  temps |>
+    group_by(airport, target) |>
+    mutate(actual = lead(temp, h)) |>
+    ungroup() |>
+    transmute(origin = date, airport, target, lead = h, actual)
+})) |>
+  inner_join(origins, by = "origin")
+
+# MSE of each method. A missing forecast is kept as NA (not dropped), so that
+# every method is scored on the same targets and a gap shows up in the table.
+score <- function(forecasts, ...) {
+  forecasts |>
+    filter(!is.na(actual)) |>
+    mutate(sq_error = (actual - pred)^2, error = actual - pred,
+           fold_year = year) |>
+    group_by(method, ..., fold_year) |>
+    summarise(
+      sse    = sum(sq_error),
+      n      = n(),
+      sse_15 = sum(sq_error[day15]),
+      n_15   = sum(day15),
+      err    = sum(error),
+      .groups = "drop"
+    ) |>
+    group_by(method, ...) |>
+    summarise(
+      mse       = sum(sse) / sum(n),               # all-start-days score
+      se        = sd(sse / n) / sqrt(n()),         # from the spread of the yearly scores
+      mse_day15 = sum(sse_15) / sum(n_15),         # day-15 score
+      bias      = sum(err) / sum(n),               # mean error (actual - forecast)
+      n         = sum(n),
+      .groups = "drop"
+    )
+}
+
+# Compare a new model with a simpler one, using yearly MSE differences
+compare <- function(forecasts, simpler, new) {
+  yearly <- forecasts |>
+    filter(!is.na(actual), method %in% c(simpler, new)) |>
+    group_by(method, year) |>
+    summarise(mse = mean((actual - pred)^2), .groups = "drop") |>
+    pivot_wider(names_from = method, values_from = mse)
+  yearly_gain <- yearly[[simpler]] - yearly[[new]]
+  tibble(
+    gain           = mean(yearly_gain),
+    se             = sd(yearly_gain) / sqrt(length(yearly_gain)),
+    years_improved = sum(yearly_gain > 0),
+    decision       = if_else(gain > 2 * se, "keep new terms", "tie: keep simpler")
+  )
+}
+
+# Leave-one-year-out with a 30-day gap
+cv_years <- 2005:2014
+gap_days <- 30
+
+# TRUE for dates that may be used to train when test_year is held out
+is_training_day <- function(dates, test_year, gap = gap_days) {
+  gap_start <- as.Date(sprintf("%d-01-01", test_year)) - gap
+  gap_end   <- as.Date(sprintf("%d-12-31", test_year)) + gap
+  dates < gap_start | dates > gap_end
+}
+
+# Start days whose whole 20-day window is allowed in training
+training_origins <- function(test_year) {
+  origins |>
+    filter(is_training_day(origin - 14, test_year),
+           is_training_day(origin + 5,  test_year)) |>
+    pull(origin)
+}
+
+# Run a method through all ten folds.
+# forecast_year(train, test) gets the training start days and the held-out
+# year's start days, and returns the matching rows of `truth` with `pred` and `method`.
+run_cv <- function(forecast_year) {
+  bind_rows(lapply(cv_years, function(y) {
+    forecast_year(train = training_origins(y),
+                  test  = origins$origin[origins$year == y])
+  }))
+}
+```
+
+**Check the setup.**
+
+```{r}
+tibble(
+  Item = c("Start days per year (2005-2014 average)",
+           "Start days on the 15th, all years",
+           "Forecasts, all-start-days score",
+           "Forecasts, day-15 score",
+           "Targets with no observed temperature"),
+  Value = format(c(round(nrow(origins) / 10),
+                   sum(origins$day15),
+                   nrow(truth),
+                   sum(truth$day15),
+                   sum(is.na(truth$actual))),
+                 big.mark = ",", trim = TRUE)
+) |>
+  show_table("Size of the scoring set.")
+```
+
+```{r}
+# What the 30-day gap removes when 2010 is held out
+train_2010 <- training_origins(2010)
+tibble(
+  Item = c("Training start days",
+           "Last training start day before 2010",
+           "First training start day after 2010"),
+  Value = c(format(length(train_2010), big.mark = ","),
+            format(max(train_2010[train_2010 < as.Date("2010-01-01")])),
+            format(min(train_2010[train_2010 > as.Date("2010-12-31")])))
+) |>
+  show_table("Training set when 2010 is held out.")
+```
+
+The last training start day before 2010 is November 26, 2009: its 5 forecast days end on December 1, just before the gap. The first one after 2010 is February 14, 2011: its 15 input days start on January 31, just after the gap.
+
+# Step 1: Baseline regression
+
+## Model
+
+We start with the simplest regression that uses everything a forecast may use: **the 15 known temperatures**. For each temperature type (max, mean, min) and each lead $h$ (1-5), we fit one OLS model, pooled over the 15 airports:
+
+$$
+\widehat{y}_{t+h} = \beta_{0,h} + \sum_{k=0}^{14} \beta_{k,h}\, y_{t-k}
+$$
+
+-   $y_{t-k}$ is the temperature $k$ days before the start day $t$ (`lag0` to `lag14`).
+-   This gives 3 × 5 = 15 models, each with 16 coefficients.
+
+We compare it with two simple rules. Both are special cases of the model above:
+
+-   **Persistence:** every forecast equals the start day (weight 1 on `lag0`).
+-   **15-day mean:** every forecast equals the average of the 15 days (weight 1/15 on each day).
+
+**Missing input days.** If any of the 15 input days is missing, we drop that forecast, for every method. This affects `r sum(!complete.cases(inputs[paste0("lag", 0:14)]))` of `r format(nrow(inputs), big.mark = ",")` input windows (about 0.1%). In the validation year we must forecast every case, so we will choose a fill-in rule for the final model.
+
+```{r}
+lag_cols <- paste0("lag", 0:14)
+
+model_rows <- truth |>
+  inner_join(inputs, by = c("origin", "airport", "target")) |>
+  filter(if_all(all_of(lag_cols), \(x) !is.na(x)))
+
+rules <- model_rows |>
+  mutate(Persistence   = lag0,
+         `15-day mean` = rowMeans(across(all_of(lag_cols)))) |>
+  pivot_longer(c(Persistence, `15-day mean`), names_to = "method", values_to = "pred")
+
+# One OLS model per temperature type and lead, for run_cv()
+lm_forecaster <- function(formula, name) {
+  function(train, test) {
+    train_rows <- filter(model_rows, origin %in% train)
+    test_rows  <- filter(model_rows, origin %in% test)
+    bind_rows(lapply(split(test_rows, list(test_rows$target, test_rows$lead)), function(te) {
+      tr  <- filter(train_rows, target == te$target[1], lead == te$lead[1])
+      fit <- lm(formula, data = tr)
+      mutate(te, pred = predict(fit, newdata = te), method = name)
+    }))
+  }
+}
+
+mlr_formula <- reformulate(lag_cols, response = "actual")
+
+baseline    <- run_cv(lm_forecaster(mlr_formula, "Baseline regression"))
+baseline_ap <- run_cv(lm_forecaster(update(mlr_formula, . ~ . + airport),
+                                    "Baseline + airport intercepts"))
+
+step1 <- bind_rows(rules, baseline, baseline_ap) |>
+  mutate(method = factor(method, levels = c("Persistence", "15-day mean",
+                                            "Baseline regression",
+                                            "Baseline + airport intercepts")))
+
+step1_overall <- score(step1)
+step1_lead    <- score(step1, lead)
+step1_year    <- score(step1, year)
+ap_check      <- compare(step1, "Baseline regression", "Baseline + airport intercepts")
+
+# Numbers in the text, always with one decimal
+mse_of <- function(tbl, m, ..., col = "mse") {
+  filter(tbl, method == m, ...) |> pull(col) |> sprintf(fmt = "%.1f")
+}
+```
+
+## Results
+
+```{r}
+step1_overall |>
+  transmute(Method = method,
+            `All-start-days MSE` = mse,
+            `Std. error` = se,
+            `Day-15 MSE` = mse_day15,
+            Forecasts = format(n, big.mark = ",")) |>
+  show_table("Step 1: MSE (°F²). Regressions are scored by leaving one year out.")
+```
+
+```{r}
+#| fig-width: 7
+#| fig-height: 3.5
+#| fig-cap: "All-start-days MSE by lead."
+
+lead_plot   <- filter(step1_lead, method != "Baseline + airport intercepts")
+lead_labels <- filter(lead_plot, lead == 5) |>
+  mutate(vjust = if_else(method == "Baseline regression", 1.8, -0.8))
+
+ggplot(lead_plot, aes(lead, mse, color = method)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 2) +
+  geom_text(data = lead_labels, aes(label = method, vjust = vjust),
+            hjust = 0.9, size = 3.5, color = "grey20", show.legend = FALSE) +
+  scale_color_manual(values = method_colors, name = NULL) +
+  scale_x_continuous(breaks = 1:5, labels = paste(1:5, "day(s) ahead")) +
+  scale_y_continuous(limits = c(0, NA), expand = expansion(mult = c(0, 0.1))) +
+  labs(x = "Lead", y = "MSE (°F²)") +
+  theme_minimal(base_size = 11) +
+  theme(panel.grid.minor = element_blank(), legend.position = "bottom")
+```
+
+**What we found.**
+
+-   **The regression is the best method** (MSE `r mse_of(step1_overall, "Baseline regression")`), better than the 15-day mean (`r mse_of(step1_overall, "15-day mean")`) and persistence (`r mse_of(step1_overall, "Persistence")`). It is the best at every lead.
+-   **Persistence is good only 1 day ahead.** The 15-day mean is never very good, but it gets worse only slowly.
+-   **Airport intercepts help only a little.** The MSE drops by `r sprintf("%.2f", ap_check$gain)`. The drop is consistent (better in `r ap_check$years_improved` of 10 years), but small compared with the seasonal problem below. Airport intercepts come back in Step 2, as part of the airport-specific seasonal terms.
+
+## What the regression learned
+
+The figure shows the weights of the regression for the daily mean, fitted on all ten years. Max and min look the same.
+
+```{r}
+#| fig-width: 8
+#| fig-height: 3
+#| fig-cap: "Weights of the baseline regression (daily mean, all ten years). One panel per lead."
+
+fit_mean <- model_rows |>
+  filter(target == "Mean") |>
+  group_by(lead) |>
+  group_modify(\(d, key) {
+    fit <- lm(mlr_formula, data = d)
+    tibble(term = names(coef(fit)), estimate = unname(coef(fit)))
+  }) |>
+  ungroup()
+
+weights <- fit_mean |>
+  filter(term != "(Intercept)") |>
+  mutate(days_before = as.integer(sub("lag", "", term)))
+
+ggplot(weights, aes(days_before, estimate)) +
+  geom_hline(yintercept = 0, color = "grey60", linewidth = 0.4) +
+  geom_col(fill = method_colors[1], width = 0.7) +
+  facet_wrap(~ lead, nrow = 1, labeller = labeller(lead = \(x) paste("Lead", x))) +
+  scale_x_continuous(breaks = c(0, 7, 14)) +
+  labs(x = "Days before the start day (0 = start day)", y = "Weight") +
+  theme_minimal(base_size = 11) +
+  theme(panel.grid.minor = element_blank(), panel.grid.major.x = element_blank())
+
+# Level the forecasts move toward: intercept / (1 - sum of weights)
+center <- fit_mean |>
+  group_by(lead) |>
+  summarise(level = estimate[term == "(Intercept)"] /
+                    (1 - sum(estimate[term != "(Intercept)"])))
+```
+
+**What we found.**
+
+-   **1 day ahead, the start day gets most of the weight** (`r sprintf("%.2f", weights$estimate[weights$lead == 1 & weights$days_before == 0])`). **5 days ahead, the weight is spread over all 15 days.** So the regression combines the two simple rules: persistence for short leads, an average for long leads.
+-   **The weights add up to slightly less than 1.** With the intercept, this moves every forecast toward about `r round(mean(center$level))`°F, the average temperature over all airports and seasons. This is the same level for Key West in July and for Duluth in January, which is clearly wrong.
+
+## Residual plot
+
+The figure plots the residuals of the regression against the day of the year, at four airports with different climates. The model is the one fitted on all ten years, for the daily mean 3 days ahead; other leads and types look similar. **Above zero means the forecast was too cold.**
+
+```{r}
+#| fig-width: 8
+#| fig-height: 3.2
+#| fig-cap: "Residuals of the baseline regression (daily mean, lead 3) against the day of the year. The blue line is a smooth trend."
+#| message: false
+
+example_airports <- c(DLH = "Duluth (DLH)", DEN = "Denver (DEN)",
+                      SFO = "San Francisco (SFO)", EYW = "Key West (EYW)")
+
+lead3 <- filter(model_rows, target == "Mean", lead == 3, !is.na(actual))
+lead3$residual <- residuals(lm(mlr_formula, data = lead3))
+
+lead3 |>
+  filter(airport %in% names(example_airports)) |>
+  mutate(day_of_year = as.integer(format(origin + lead, "%j")),
+         airport = factor(example_airports[airport], levels = example_airports)) |>
+  ggplot(aes(day_of_year, residual)) +
+  geom_point(color = "grey70", size = 0.3, alpha = 0.4) +
+  geom_hline(yintercept = 0, color = "grey40", linewidth = 0.4) +
+  geom_smooth(method = "loess", se = FALSE, color = method_colors[1], linewidth = 0.9) +
+  facet_wrap(~ airport, nrow = 1) +
+  scale_x_continuous(breaks = c(1, 91, 182, 274), labels = c("Jan", "Apr", "Jul", "Oct")) +
+  coord_cartesian(ylim = c(-20, 20)) +
+  labs(x = "Day of the year (target day)", y = "Residual (°F)") +
+  theme_minimal(base_size = 11) +
+  theme(panel.grid.minor = element_blank())
+```
+
+**What we found.**
+
+-   **The residuals follow the seasons.** The forecasts are too cold in spring and too warm in autumn. The model does not know the date, so it is always behind the seasonal cycle.
+-   **The pattern is different at each airport.** It is large at Duluth and Denver and small at San Francisco. At Key West, the residuals are above zero most of the year, because Key West is much warmer than the 58°F level.
+-   **The spread is also larger in winter** at inland airports. Winter weather changes more from day to day.
+
+## How much one year varies
+
+The table scores the regression on each held-out year separately. The model is the same, so the differences come from the weather of each year.
+
+```{r}
+step1_year |>
+  filter(method == "Baseline regression") |>
+  transmute(Year = as.character(year),
+            `Day-15 MSE` = mse_day15,
+            `All-start-days MSE` = mse) |>
+  pivot_longer(-Year, names_to = "Score") |>
+  pivot_wider(names_from = Year, values_from = value) |>
+  show_table("Baseline regression: MSE (°F²) of each held-out year.")
+
+year_scores <- filter(step1_year, method == "Baseline regression")
+```
+
+-   With the day-15 score, one year ranges from `r sprintf("%.1f", min(year_scores$mse_day15))` to `r sprintf("%.1f", max(year_scores$mse_day15))`. With the all-start-days score, it ranges from `r sprintf("%.1f", min(year_scores$mse))` to `r sprintf("%.1f", max(year_scores$mse))`. **This is why we compare models with the all-start-days score.**
+-   The validation score comes from one year only, so it can differ from our estimate by several points. We will report the expected MSE with this range.
+
+## Next step
+
+-   **Baseline to beat:** MSE `r mse_of(step1_overall, "Baseline regression")` (day-15 MSE `r mse_of(step1_overall, "Baseline regression", col = "mse_day15")`).
+-   **The model needs to know the date.** The residuals show a seasonal pattern that differs by airport. In Step 2 we add a seasonal term and test whether it should differ by airport.
+
+
+# Step 2: Seasonality
+
+## Model
+
+We add sine and cosine terms of the target day's day of the year $d$, with $\omega = 2\pi / 365.25$:
+
+-   **1st harmonic:** $\sin(\omega d)$ and $\cos(\omega d)$. One smooth yearly cycle. The data choose its size and its peak date.
+-   **2nd harmonic:** $\sin(2\omega d)$ and $\cos(2\omega d)$. Lets the cycle be asymmetric, for example faster cooling in autumn than warming in spring.
+
+Each model adds terms to an earlier one. "Airport-specific" means each airport gets its own intercept and its own harmonic coefficients.
+
+| Model | Terms | Added coefficients |
+|-------|----------------------------------------------|--------------------|
+| M0 | Baseline (Step 1): the 15 known days | — |
+| M1 | M0 + shared 1st harmonic | 2 |
+| M2 | M1 + shared 2nd harmonic | 2 |
+| M3 | M1 + airport-specific 1st harmonic | 42 |
+| M4 | M3 + airport-specific 2nd harmonic | 30 |
+
+We check each step in two ways:
+
+1.  **Robust Wald test.** H0: the added coefficients are all 0. We fit on all ten years and all start days. Forecasts in the same month share weather (the same days at different airports, and overlapping 15-day windows), so we use standard errors clustered by calendar month (year × month, 120 clusters). There is one test for each temperature type and lead (15 tests); we show the weakest result.
+2.  **Cross-validation.** `compare()` checks whether the drop in MSE is larger than 2 standard errors.
+
+```{r}
+omega <- 2 * pi / 365.25
+
+model_rows <- model_rows |>
+  mutate(day_of_year   = as.integer(format(origin + lead, "%j")),
+         sin1 = sin(omega * day_of_year),     cos1 = cos(omega * day_of_year),
+         sin2 = sin(2 * omega * day_of_year), cos2 = cos(2 * omega * day_of_year),
+         month_cluster = format(origin, "%Y-%m"))
+
+season_formulas <- list(
+  M0 = mlr_formula,
+  M1 = update(mlr_formula, . ~ . + sin1 + cos1),
+  M2 = update(mlr_formula, . ~ . + sin1 + cos1 + sin2 + cos2),
+  M3 = update(mlr_formula, . ~ . + sin1 + cos1 + airport + airport:(sin1 + cos1)),
+  M4 = update(mlr_formula, . ~ . + sin1 + cos1 + sin2 + cos2 +
+                airport + airport:(sin1 + cos1 + sin2 + cos2))
+)
+
+comparisons <- tibble(
+  simpler  = c("M0", "M1", "M1", "M3"),
+  new      = c("M1", "M2", "M3", "M4"),
+  question = c("Is there a seasonal cycle?",
+               "Is the shared cycle asymmetric?",
+               "Does the cycle differ by airport?",
+               "Is each airport's cycle asymmetric?")
+)
+
+# Robust Wald tests: one per temperature type and lead
+wald_tests <- model_rows |>
+  filter(!is.na(actual)) |>
+  group_split(target, lead) |>
+  lapply(\(d) {
+    fits <- lapply(season_formulas, lm, data = d)
+    bind_rows(lapply(seq_len(nrow(comparisons)), \(i) {
+      small <- fits[[comparisons$simpler[i]]]
+      big   <- fits[[comparisons$new[i]]]
+      w <- waldtest(small, big, vcov = vcovCL(big, cluster = d$month_cluster), test = "F")
+      tibble(new = comparisons$new[i], df = w$Df[2], F = w$F[2], p = w$`Pr(>F)`[2])
+    }))
+  }) |>
+  bind_rows()
+
+# Cross-validation (M0 is the Step 1 baseline)
+step2 <- bind_rows(
+  mutate(baseline, method = "M0"),
+  lapply(c("M1", "M2", "M3", "M4"), \(m) run_cv(lm_forecaster(season_formulas[[m]], m)))
+)
+step2_overall <- score(step2)
+
+step2_results <- comparisons |>
+  left_join(wald_tests |>
+              group_by(new) |>
+              summarise(df = first(df), F_min = min(F), p_max = max(p)),
+            by = "new") |>
+  bind_cols(bind_rows(lapply(seq_len(nrow(comparisons)), \(i) {
+    compare(step2, comparisons$simpler[i], comparisons$new[i])
+  })))
+```
+
+## Results
+
+```{r}
+step2_results |>
+  transmute(Step = paste(new, "vs", simpler),
+            Question = question,
+            `Added coef.` = as.character(df),
+            `Smallest F` = F_min,
+            `Largest p` = format.pval(p_max, digits = 2, eps = 1e-16),
+            `MSE gain` = gain,
+            `Std. error` = se,
+            `Years better` = paste(years_improved, "/ 10"),
+            Decision = decision) |>
+  show_table("Step 2: robust Wald tests (weakest of the 15 models) and cross-validated MSE gain (°F²).",
+             digits = 2)
+
+step2_overall |>
+  transmute(Model = method,
+            `All-start-days MSE` = mse,
+            `Day-15 MSE` = mse_day15) |>
+  show_table("Step 2: MSE (°F²) of each model.")
+```
+
+```{r}
+# Numbers for the text
+res <- \(m, col) step2_results[[col]][step2_results$new == m]
+fmt <- \(x, d = 2) sprintf(paste0("%.", d, "f"), x)
+pfmt <- \(p) if (p < 1e-16) "p < 1e-16" else paste("p =", signif(p, 2))
+```
+
+**What we found.**
+
+-   **There is a seasonal cycle (M1).** The test rejects H0 in all 15 models (largest `r pfmt(res("M1", "p_max"))`). The MSE drops by `r fmt(res("M1", "gain"))`, and it is better in all 10 years.
+-   **A shared asymmetric cycle does not help (M2).** The test is weak (largest p = `r fmt(res("M2", "p_max"), 3)`) and the MSE gain is only `r fmt(res("M2", "gain"))`. By our rule this is a tie, so we do not use the shared 2nd harmonic on its own.
+-   **The cycle differs by airport (M3).** This is the largest gain: `r fmt(res("M3", "gain"))`, better in all 10 years.
+-   **Each airport's cycle is asymmetric (M4).** The gain is small (`r fmt(res("M4", "gain"))`, `r fmt(res("M4", "gain") / res("M4", "se"), 1)` standard errors, better in `r res("M4", "years_improved")` of 10 years), but it passes our rule and the test. We keep it.
+
+## Residual check
+
+The figure repeats the Step 1 residual plot (daily mean, 3 days ahead, fitted on all ten years), now for both M0 and M4. Only the smooth trend lines are shown.
+
+```{r}
+#| fig-width: 8
+#| fig-height: 3.2
+#| fig-cap: "Smooth trend of the residuals against the day of the year, before (M0) and after (M4) adding airport-specific seasonality. Daily mean, lead 3."
+#| message: false
+
+lead3 <- filter(model_rows, target == "Mean", lead == 3, !is.na(actual))
+lead3$M0 <- residuals(lm(season_formulas$M0, data = lead3))
+lead3$M4 <- residuals(lm(season_formulas$M4, data = lead3))
+
+lead3 |>
+  filter(airport %in% names(example_airports)) |>
+  pivot_longer(c(M0, M4), names_to = "model", values_to = "residual") |>
+  mutate(model = factor(model, levels = c("M0", "M4"),
+                        labels = c("M0: baseline", "M4: airport-specific seasonality")),
+         airport = factor(example_airports[airport], levels = example_airports)) |>
+  ggplot(aes(day_of_year, residual, color = model)) +
+  geom_hline(yintercept = 0, color = "grey40", linewidth = 0.4) +
+  geom_smooth(method = "loess", se = FALSE, linewidth = 0.9) +
+  facet_wrap(~ airport, nrow = 1) +
+  scale_color_manual(values = method_colors, name = NULL) +
+  scale_x_continuous(breaks = c(1, 91, 182, 274), labels = c("Jan", "Apr", "Jul", "Oct")) +
+  labs(x = "Day of the year (target day)", y = "Residual (°F)") +
+  theme_minimal(base_size = 11) +
+  theme(panel.grid.minor = element_blank(), legend.position = "bottom")
+```
+
+**What we found.**
+
+-   **The seasonal pattern in the residuals is gone.** With M4, the trend line stays within about 1°F of 0 at every airport, including Key West. The small bumps at the start and end of the year are partly caused by the smoothing, which has fewer points at the edges.
+-   **The MSE is still `r fmt(filter(step2_overall, method == "M4")$mse, 1)`.** What is left is day-to-day weather that the date and the last 15 days cannot predict.
+
+## Next step
+
+-   **New model to beat:** M4, MSE `r fmt(filter(step2_overall, method == "M4")$mse, 1)` (day-15 MSE `r fmt(filter(step2_overall, method == "M4")$mse_day15, 1)`), down from `r fmt(filter(step2_overall, method == "M0")$mse, 1)` in Step 1.
+-   **The next steps add more information:** other weather variables and nearby airports.
+
+
+# Step 3: Other weather at the same airport
+
+## Model
+
+We add other weather measured at the same airport, in blocks. Each block is added to the current model and **kept only if it passes our rule** (MSE gain larger than 2 standard errors). The order was fixed before looking at the results.
+
+| Block | Inputs on the start day |
+|-------|----------------------------------------------------------|
+| A | The other two temperature types (for example, max and min when we forecast the mean) |
+| B | Pressure, and its change from the day before |
+| C | Dew point and humidity |
+| D | Wind, split into an east-west part and a north-south part (speed × sine and cosine of the direction) |
+| E | Cloud cover, visibility, precipitation, and the rain, snow, fog and thunder flags |
+| F1 | The kept inputs on the **day before** the start day |
+| F2 | The kept inputs **averaged over days 2-14** before the start day |
+
+Blocks F1 and F2 answer the question: how many days of these inputs are useful?
+
+**Details.**
+
+-   **Departures.** Each input (except the yes/no flags) is used as a departure from that airport's usual value for that day of the year. The usual value comes from a 2-harmonic seasonal curve for each airport. M4 already contains each airport's seasonal terms, so in OLS this gives almost the same forecasts as raw values. Departures will matter in Step 4.
+-   **Gust** is not used (many missing values, concentrated in 2005-2006 and on calm days).
+-   **Missing values.** We drop a forecast if an input is missing on the start day or the day before. The average in F2 uses the days that are available.
+-   **Pressure on the day before** is left out of F1. Today's pressure change already contains it, so adding it would make the model exactly collinear.
+-   **Tests.** As in Step 2: a robust Wald test for each block (weakest of the 15 models) and the cross-validated MSE gain.
+
+```{r}
+# Departure from each airport's seasonal curve (2 harmonics)
+departure <- function(x, d) {
+  force(x); force(d)
+  residuals(lm(x ~ sin(omega * d) + cos(omega * d) + sin(2 * omega * d) + cos(2 * omega * d),
+               na.action = na.exclude))
+}
+
+# Average of days 2-14 before, over the available days
+older_mean <- function(x) {
+  m <- rowMeans(sapply(2:14, function(k) dplyr::lag(x, k)), na.rm = TRUE)
+  replace(m, is.nan(m), NA)
+}
+
+daily_weather <- weather_clean |>
+  filter(airport %in% target_airports) |>
+  arrange(airport, date) |>
+  mutate(d = as.integer(format(date, "%j")),
+         wind_dir = WindDirDegrees * pi / 180) |>
+  group_by(airport) |>
+  transmute(
+    date,
+    t_Max    = departure(Max.TemperatureF, d),
+    t_Mean   = departure(Mean.TemperatureF, d),
+    t_Min    = departure(Min.TemperatureF, d),
+    pressure        = departure(Mean.Sea.Level.PressureIn, d),
+    pressure_change = Mean.Sea.Level.PressureIn - lag(Mean.Sea.Level.PressureIn),
+    dew_point  = departure(Mean.DewPointF, d),
+    humidity   = departure(Mean.Humidity, d),
+    wind_u     = departure(Mean.Wind.SpeedMPH * sin(wind_dir), d),
+    wind_v     = departure(Mean.Wind.SpeedMPH * cos(wind_dir), d),
+    cloud      = departure(CloudCover, d),
+    visibility = departure(Mean.VisibilityMiles, d),
+    precip     = departure(PrecipitationIn, d),
+    rain = as.numeric(ev_rain), snow = as.numeric(ev_snow),
+    fog  = as.numeric(ev_fog),  thunder = as.numeric(ev_thunder)
+  ) |>
+  mutate(across(-date, \(x) lag(x, 1), .names = "{.col}_d1"),
+         across(-c(date, ends_with("_d1")), older_mean, .names = "{.col}_old")) |>
+  ungroup()
+
+blocks <- list(
+  A = c("other_1", "other_2"),
+  B = c("pressure", "pressure_change"),
+  C = c("dew_point", "humidity"),
+  D = c("wind_u", "wind_v"),
+  E = c("cloud", "visibility", "precip", "rain", "snow", "fog", "thunder")
+)
+block_names <- c(A = "A. Other temperature types", B = "B. Pressure", C = "C. Moisture",
+                 D = "D. Wind", E = "E. Sky, rain and events",
+                 F1 = "F1. Day before", F2 = "F2. Days 2-14 before (average)")
+
+# The other two temperature types: Max -> (Mean, Min), Mean -> (Max, Min), Min -> (Max, Mean)
+step3_rows <- model_rows |>
+  left_join(daily_weather, by = c("origin" = "date", "airport")) |>
+  mutate(other_1     = if_else(target == "Max", t_Mean,     t_Max),
+         other_2     = if_else(target == "Min", t_Mean,     t_Min),
+         other_1_d1  = if_else(target == "Max", t_Mean_d1,  t_Max_d1),
+         other_2_d1  = if_else(target == "Min", t_Mean_d1,  t_Min_d1),
+         other_1_old = if_else(target == "Max", t_Mean_old, t_Max_old),
+         other_2_old = if_else(target == "Min", t_Mean_old, t_Min_old))
+
+all_inputs <- unlist(blocks)
+used_inputs <- c(all_inputs, paste0(setdiff(all_inputs, "pressure"), "_d1"), paste0(all_inputs, "_old"))
+rows_before <- nrow(step3_rows)
+step3_rows <- filter(step3_rows, if_all(all_of(used_inputs), \(x) !is.na(x)))
+```
+
+The Step 3 models are larger, so we compute the same OLS fit faster with the normal equations. For each temperature type and lead we compute $X^\top X$ and $X^\top y$ once. For each fold, we subtract the held-out year and the 30-day gap and solve for $\hat\beta = (X^\top X)^{-1} X^\top y$. This gives the same forecasts as `lm()`, including dropping columns that are exact combinations of other columns.
+
+```{r}
+# `daily_extra` (used in Step 4): a function of the held-out year that returns
+# columns with one row per date, which change from fold to fold
+# `years` and `train_fun` (used in Step 6) change which years are held out
+# and which start days each fold trains on
+run_cv_ols <- function(formula, name, data, daily_extra = NULL,
+                       years = cv_years, train_fun = training_origins) {
+  rhs <- delete.response(terms(formula))
+  bind_rows(lapply(split(data, list(data$target, data$lead), drop = TRUE), \(g) {
+    g   <- filter(g, !is.na(actual))
+    y   <- g$actual
+    X   <- model.matrix(rhs, g)
+    qx  <- qr(X)                                     # drop exactly collinear columns, as lm() does
+    X   <- X[, sort(qx$pivot[seq_len(qx$rank)]), drop = FALSE]
+    XtX <- crossprod(X)
+    Xty <- crossprod(X, y)
+    bind_rows(lapply(years, \(yr) {
+      out  <- !(g$origin %in% train_fun(yr))          # held-out year, gap (and unused years)
+      test <- g$year == yr
+      A    <- XtX - crossprod(X[out, , drop = FALSE])
+      b    <- Xty - crossprod(X[out, , drop = FALSE], y[out])
+      if (is.null(daily_extra)) {
+        pred <- drop(X[test, , drop = FALSE] %*% solve(A, b))
+      } else {
+        # Daily columns are the same for every airport on a date, so their
+        # cross-products can be built from daily sums
+        P   <- daily_extra(yr)
+        day <- match(g$origin, all_dates)
+        tr  <- !out
+        Xs  <- rowsum(X[tr, , drop = FALSE], day[tr])
+        Pd  <- P[as.integer(rownames(Xs)), , drop = FALSE]
+        nd  <- drop(rowsum(rep(1, sum(tr)), day[tr]))
+        XtP <- crossprod(Xs, Pd)
+        A   <- rbind(cbind(A, XtP), cbind(t(XtP), crossprod(Pd * sqrt(nd))))
+        b   <- c(b, crossprod(Pd, rowsum(y[tr], day[tr])))
+        pred <- drop(cbind(X[test, , drop = FALSE], P[day[test], , drop = FALSE]) %*% solve(A, b))
+      }
+      transmute(g[test, ], origin, airport, target, lead, year, month, day15, actual,
+                pred = pred, method = name)
+    }))
+  }))
+}
+all_dates <- sort(unique(weather_clean$date))
+
+add_terms <- function(formula, new_terms) {
+  update(formula, reformulate(c(".", new_terms), response = "."))
+}
+
+# Add the blocks one at a time; keep a block only if it passes the rule
+step3_cv      <- run_cv_ols(season_formulas$M4, "M4", step3_rows)
+formulas3     <- list(M4 = season_formulas$M4)
+current       <- "M4"
+kept          <- character(0)
+step3_results <- list()
+
+for (b in c(names(blocks), "F1", "F2")) {
+  new_terms <- switch(b,
+                      F1 = paste0(setdiff(kept, "pressure"), "_d1"),
+                      F2 = paste0(kept, "_old"),
+                      blocks[[b]])
+  formulas3[[b]] <- add_terms(formulas3[[current]], new_terms)
+  step3_cv <- bind_rows(step3_cv, run_cv_ols(formulas3[[b]], b, step3_rows))
+  result   <- compare(step3_cv, current, b)
+  step3_results[[b]] <- tibble(block = b, simpler = current, n_terms = length(new_terms), result)
+  if (result$decision == "keep new terms") {
+    current <- b
+    if (b %in% names(blocks)) kept <- c(kept, new_terms)
+  }
+}
+step3_results <- bind_rows(step3_results)
+step3_final   <- current
+
+# Robust Wald test for each block, as in Step 2
+wald3 <- step3_rows |>
+  filter(!is.na(actual)) |>
+  group_split(target, lead) |>
+  lapply(\(d) {
+    bind_rows(lapply(seq_len(nrow(step3_results)), \(i) {
+      small <- lm(formulas3[[step3_results$simpler[i]]], data = d)
+      big   <- lm(formulas3[[step3_results$block[i]]], data = d)
+      w <- waldtest(small, big, vcov = vcovCL(big, cluster = d$month_cluster), test = "F")
+      tibble(block = step3_results$block[i], F = w$F[2], p = w$`Pr(>F)`[2])
+    }))
+  }) |>
+  bind_rows()
+
+step3_results <- step3_results |>
+  left_join(wald3 |> group_by(block) |> summarise(n_sig = sum(p < 0.05), p_max = max(p)),
+            by = "block")
+```
+
+## Results
+
+`r format(rows_before - nrow(step3_rows), big.mark = ",")` of `r format(rows_before, big.mark = ",")` forecasts (`r sprintf("%.2f", 100 * (rows_before - nrow(step3_rows)) / rows_before)`%) were dropped for missing inputs. M4 is refitted on the remaining forecasts, so every model below is scored on the same forecasts.
+
+```{r}
+step3_results |>
+  transmute(Block = block_names[block],
+            `Added terms` = as.character(n_terms),
+            `Significant (p < 0.05)` = paste(n_sig, "/ 15"),
+            `Largest p` = format.pval(p_max, digits = 2, eps = 1e-16),
+            `MSE gain` = gain,
+            `Std. error` = se,
+            `Years better` = paste(years_improved, "/ 10"),
+            Decision = decision) |>
+  show_table("Step 3: each block compared with the model before it. Robust Wald test (in how many of the 15 models it is significant, and the largest p) and cross-validated MSE gain (°F²).",
+             digits = 2)
+
+score(filter(step3_cv, method %in% c("M4", step3_final)), lead) |>
+  mutate(Model = if_else(method == "M4", "M4 (Step 2)", "Step 3 model")) |>
+  select(Model, lead, mse) |>
+  pivot_wider(names_from = lead, values_from = mse, names_prefix = "Lead ") |>
+  left_join(score(filter(step3_cv, method %in% c("M4", step3_final))) |>
+              transmute(Model = if_else(method == "M4", "M4 (Step 2)", "Step 3 model"),
+                        `All leads` = mse, `Day-15 MSE` = mse_day15),
+            by = "Model") |>
+  show_table("All-start-days MSE (°F²) by lead, before and after Step 3.")
+```
+
+```{r}
+# Numbers for the text
+r3 <- \(b, col) step3_results[[col]][step3_results$block == b]
+mse3 <- \(m, col = "mse") score(filter(step3_cv, method == m))[[col]]
+```
+
+**What we found.**
+
+-   **All five weather blocks lower the MSE in all 10 years**, so all pass our rule.
+-   **Pressure is by far the most useful** (gain `r fmt(r3("B", "gain"))`). The other blocks add between `r fmt(min(step3_results$gain[step3_results$block %in% c("A", "C", "D", "E")]))` and `r fmt(max(step3_results$gain[step3_results$block %in% c("A", "C", "D", "E")]))`.
+-   **The test does not always agree.** For the other temperature types (A) and moisture (C), the test is significant in only `r r3("A", "n_sig")` and `r r3("C", "n_sig")` of 15 models, mostly at short leads and rarely for the daily max. These blocks help on average, but only for some temperature types and leads.
+-   **The day before helps a little** (F1, gain `r fmt(r3("F1", "gain"))`). **Older days do not help** (F2, gain `r fmt(r3("F2", "gain"))`, a tie), even though their test is significant in `r r3("F2", "n_sig")` of 15 models. A significant coefficient does not always give better forecasts, which is why cross-validation makes our decisions.
+-   **The gain is mostly at short leads.** Weather today tells us a lot about tomorrow, but little about 5 days ahead.
+
+## Next step
+
+-   **New model to beat:** the Step 3 model (M4 + blocks A-E + the day before), MSE `r fmt(mse3(step3_final), 1)` (day-15 MSE `r fmt(mse3(step3_final, "mse_day15"), 1)`), down from `r fmt(mse3("M4"), 1)`.
+-   **Next: nearby airports.** Weather moves from place to place, so other airports may help at longer leads, where the local inputs add little.
+
+
+# Step 4: Nearby airports
+
+## Model
+
+Weather moves from place to place, so other airports may tell us what is coming. From each other airport we use **mean temperature and pressure**: the departure from normal on the start day, and the change from the day before. We test four blocks, from near to far. The order was fixed before looking at the results.
+
+| Block | Inputs |
+|-------|----------------------------------------------------------|
+| G. Nearest airports | The $k$ nearest airports, each as a separate input. $k$ = 1, 3, 5 or 10, chosen by CV |
+| I. Pressure gradient | The east-west and north-south slope of pressure across the target and its 5 nearest airports (a plane fitted by OLS each day) |
+| H. Upwind airports | The average over airports to the **west** (bearing 225°-315°), in 3 distance bands: 0-750, 750-1,500 and 1,500-3,000 km |
+| J. National components | Principal components of all airports, separately for temperature level, temperature change, pressure level and pressure change. $n$ = 2, 4, 8 or 16 components of each, chosen by CV |
+
+**Details.**
+
+-   **Choosing $k$ and $n$.** We take the smallest setting whose MSE is within 2 standard errors of the best setting (the same rule as before).
+-   **Missing values at other airports** are set to 0, which means "normal for that day". The target airport keeps the drop rule from Step 3.
+-   **TTN and ORD pressure** are left out (gaps of about 2.5 years each).
+-   **Principal components** (and the seasonal curves behind them) are fitted on the training years only, inside each fold.
+-   **Coordinates** come from `Rumi/common_design/resources/coordinates.csv`. AIY is blank there, so we fill it from OurAirports.
+
+```{r}
+coords <- read.csv("../Rumi/common_design/resources/coordinates.csv") |>
+  select(airport = code, lat, lon) |>
+  # AIY is blank in this file; values from OurAirports (as in Qingyuan's airport_metadata.csv)
+  mutate(lat = if_else(airport == "AIY", 39.360001, lat),
+         lon = if_else(airport == "AIY", -74.4561, lon))
+stopifnot(!anyNA(coords$lat), !anyNA(coords$lon))
+
+# Daily values at all 98 airports: one row per date, one column per airport
+wide_matrix <- function(variable) {
+  m <- weather_clean |>
+    select(date, airport, value = all_of(variable)) |>
+    pivot_wider(names_from = airport, values_from = value) |>
+    arrange(date)
+  as.matrix(select(m, -date))
+}
+raw_temp  <- wide_matrix("Mean.TemperatureF")
+raw_press <- wide_matrix("Mean.Sea.Level.PressureIn")
+raw_press[, c("TTN", "ORD")] <- NA
+airports  <- colnames(raw_temp)
+coords    <- coords[match(airports, coords$airport), ]
+has_press <- !airports %in% c("TTN", "ORD")
+
+# Departures from each airport's seasonal curve, fitted on the `use` days
+season_x <- with(list(d = as.integer(format(all_dates, "%j"))),
+                 cbind(1, sin(omega * d), cos(omega * d), sin(2 * omega * d), cos(2 * omega * d)))
+departures <- function(raw, use = rep(TRUE, nrow(raw))) {
+  for (j in seq_len(ncol(raw))) {
+    ok <- use & !is.na(raw[, j])
+    raw[, j] <- raw[, j] - drop(season_x %*% qr.coef(qr(season_x[ok, ]), raw[ok, j]))
+  }
+  raw
+}
+fill_zero  <- function(m) replace(m, is.na(m), 0)
+day_change <- function(m) rbind(NA, m[-1, ] - m[-nrow(m), ])
+
+dep_temp  <- departures(raw_temp)
+dep_press <- departures(raw_press)
+chg_temp  <- fill_zero(day_change(dep_temp))
+chg_press <- fill_zero(day_change(dep_press))
+dep_temp  <- fill_zero(dep_temp)
+dep_press <- fill_zero(dep_press)
+
+# Distance (km) and bearing (degrees from north) from airport a to airports b
+rad <- pi / 180
+distance_km <- function(a, b) {
+  la1 <- coords$lat[a] * rad; la2 <- coords$lat[b] * rad; dl <- (coords$lon[b] - coords$lon[a]) * rad
+  6371 * 2 * asin(sqrt(sin((la2 - la1) / 2)^2 + cos(la1) * cos(la2) * sin(dl / 2)^2))
+}
+bearing <- function(a, b) {
+  la1 <- coords$lat[a] * rad; la2 <- coords$lat[b] * rad; dl <- (coords$lon[b] - coords$lon[a]) * rad
+  (atan2(sin(dl) * cos(la2), cos(la1) * sin(la2) - sin(la1) * cos(la2) * cos(dl)) / rad) %% 360
+}
+
+band_mean <- function(m, cols) if (length(cols) > 0) rowMeans(m[, cols, drop = FALSE]) else rep(0, nrow(m))
+
+spatial <- bind_rows(lapply(target_airports, function(a) {
+  i      <- match(a, airports)
+  others <- setdiff(seq_along(airports), i)
+  dist   <- distance_km(i, others)
+  near_t <- others[order(dist)][1:10]
+  with_p <- others[has_press[others]]
+  near_p <- with_p[order(distance_km(i, with_p))][1:10]
+  f <- list(origin = all_dates, airport = a)
+
+  # G. Nearest airports
+  for (k in 1:10) {
+    f[[paste0("n", k, "_t")]]  <- dep_temp[, near_t[k]]
+    f[[paste0("n", k, "_tc")]] <- chg_temp[, near_t[k]]
+    f[[paste0("n", k, "_p")]]  <- dep_press[, near_p[k]]
+    f[[paste0("n", k, "_pc")]] <- chg_press[, near_p[k]]
+  }
+
+  # I. Pressure gradient: plane through the target and its 5 nearest airports
+  sites <- c(i, near_p[1:5])
+  east  <- (coords$lon[sites] - coords$lon[i]) * cos(coords$lat[i] * rad) * 111.32 / 100
+  north <- (coords$lat[sites] - coords$lat[i]) * 110.57 / 100
+  A <- cbind(1, east, north)
+  W <- solve(crossprod(A), t(A))           # rows 2-3: slope per 100 km east and north
+  f$grad_E     <- drop(dep_press[, sites] %*% W[2, ])
+  f$grad_N     <- drop(dep_press[, sites] %*% W[3, ])
+  f$grad_E_chg <- drop(chg_press[, sites] %*% W[2, ])
+  f$grad_N_chg <- drop(chg_press[, sites] %*% W[3, ])
+
+  # H. Upwind airports: west of the target, averaged in distance bands
+  west  <- between(bearing(i, others), 225, 315)
+  bands <- list(c(0, 750), c(750, 1500), c(1500, 3000))
+  for (j in 1:3) {
+    in_band <- others[west & dist >= bands[[j]][1] & dist < bands[[j]][2]]
+    in_band_p <- in_band[has_press[in_band]]
+    f[[paste0("up", j, "_t")]]  <- band_mean(dep_temp, in_band)
+    f[[paste0("up", j, "_tc")]] <- band_mean(chg_temp, in_band)
+    f[[paste0("up", j, "_p")]]  <- band_mean(dep_press, in_band_p)
+    f[[paste0("up", j, "_pc")]] <- band_mean(chg_press, in_band_p)
+  }
+  as_tibble(f)
+}))
+
+step4_rows <- step3_rows |> left_join(spatial, by = c("origin", "airport"))
+
+# J. National components, fitted on the `use` days only (a fold's training days)
+national_components <- function(use = rep(TRUE, length(all_dates)), n_max = 16) {
+  dt <- departures(raw_temp, use)
+  dp <- departures(raw_press, use)[, has_press]
+  mats <- list(t = fill_zero(dt), tc = fill_zero(day_change(dt)),
+               p = fill_zero(dp), pc = fill_zero(day_change(dp)))
+  do.call(cbind, lapply(names(mats), function(name) {
+    pca <- prcomp(mats[[name]][use, ], center = TRUE, scale. = TRUE)
+    s   <- scale(mats[[name]], pca$center, pca$scale) %*% pca$rotation[, 1:n_max]
+    colnames(s) <- paste0("pc_", name, 1:n_max)
+    s
+  }))
+}
+pcs_by_fold <- setNames(lapply(cv_years, \(yr) national_components(is_training_day(all_dates, yr))),
+                        cv_years)
+pc_names    <- function(n) as.vector(outer(c("pc_t", "pc_tc", "pc_p", "pc_pc"), 1:n, paste0))
+pc_columns  <- function(n) function(yr) pcs_by_fold[[as.character(yr)]][, pc_names(n), drop = FALSE]
+
+near_terms     <- function(k) as.vector(outer(paste0("n", 1:k), c("_t", "_tc", "_p", "_pc"), paste0))
+gradient_terms <- c("grad_E", "grad_N", "grad_E_chg", "grad_N_chg")
+upwind_terms   <- as.vector(outer(paste0("up", 1:3), c("_t", "_tc", "_p", "_pc"), paste0))
+```
+
+```{r}
+# Smallest setting whose MSE is within 2 standard errors of the best one
+pick_setting <- function(cv, settings, base) {
+  best <- settings[which.max(sapply(settings, \(m) compare(cv, base, m)$gain))]
+  for (m in settings) {
+    r <- compare(cv, m, best)
+    if (m == best || r$gain <= 2 * r$se) return(m)
+  }
+}
+
+step4_cv <- run_cv_ols(formulas3[[step3_final]], "S3", step4_rows)
+formulas4 <- list(S3 = formulas3[[step3_final]])
+current   <- "S3"
+step4_results <- list()
+tuning4       <- list()
+
+keep_if_better <- function(name, setting) {
+  r <- compare(step4_cv, current, name)
+  step4_results[[name]] <<- tibble(block = name, setting = setting, simpler = current, r)
+  if (r$decision == "keep new terms") current <<- name
+}
+
+# G. Nearest airports: choose k, then test the block
+for (k in c(1, 3, 5, 10)) {
+  formulas4[[paste0("G", k)]] <- add_terms(formulas4$S3, near_terms(k))
+  step4_cv <- bind_rows(step4_cv, run_cv_ols(formulas4[[paste0("G", k)]], paste0("G", k), step4_rows))
+}
+tuning4$G <- bind_rows(lapply(c(1, 3, 5, 10), \(k) tibble(block = "G", setting = k, compare(step4_cv, "S3", paste0("G", k)))))
+best_G <- pick_setting(step4_cv, paste0("G", c(1, 3, 5, 10)), "S3")
+formulas4$G <- formulas4[[best_G]]
+step4_cv <- bind_rows(step4_cv, mutate(filter(step4_cv, method == best_G), method = "G"))
+keep_if_better("G", paste("k =", sub("G", "", best_G)))
+
+# I. Pressure gradient
+formulas4$I <- add_terms(formulas4[[current]], gradient_terms)
+step4_cv <- bind_rows(step4_cv, run_cv_ols(formulas4$I, "I", step4_rows))
+keep_if_better("I", "")
+
+# H. Upwind airports
+formulas4$H <- add_terms(formulas4[[current]], upwind_terms)
+step4_cv <- bind_rows(step4_cv, run_cv_ols(formulas4$H, "H", step4_rows))
+keep_if_better("H", "")
+
+# J. National components: choose n, then test the block
+before_J <- current
+for (n in c(2, 4, 8, 16)) {
+  step4_cv <- bind_rows(step4_cv, run_cv_ols(formulas4[[before_J]], paste0("J", n), step4_rows,
+                                             daily_extra = pc_columns(n)))
+}
+tuning4$J <- bind_rows(lapply(c(2, 4, 8, 16), \(n) tibble(block = "J", setting = n, compare(step4_cv, before_J, paste0("J", n)))))
+best_J <- pick_setting(step4_cv, paste0("J", c(2, 4, 8, 16)), before_J)
+n_J    <- as.integer(sub("J", "", best_J))
+formulas4$J <- add_terms(formulas4[[before_J]], pc_names(n_J))
+step4_cv <- bind_rows(step4_cv, mutate(filter(step4_cv, method == best_J), method = "J"))
+keep_if_better("J", paste("n =", n_J))
+
+step4_results <- bind_rows(step4_results)
+step4_final   <- current
+```
+
+```{r}
+# Robust Wald test for each block (national components fitted on all ten years here)
+wald_rows <- step4_rows |>
+  left_join(as_tibble(national_components()[, pc_names(n_J), drop = FALSE]) |> mutate(origin = all_dates),
+            by = "origin")
+
+wald4 <- wald_rows |>
+  filter(!is.na(actual)) |>
+  group_split(target, lead) |>
+  lapply(\(d) {
+    bind_rows(lapply(seq_len(nrow(step4_results)), \(i) {
+      small <- lm(formulas4[[step4_results$simpler[i]]], data = d)
+      big   <- lm(formulas4[[step4_results$block[i]]], data = d)
+      w <- waldtest(small, big, vcov = vcovCL(big, cluster = d$month_cluster), test = "F")
+      tibble(block = step4_results$block[i], df = w$Df[2], p = w$`Pr(>F)`[2])
+    }))
+  }) |>
+  bind_rows()
+
+step4_results <- step4_results |>
+  left_join(wald4 |> group_by(block) |> summarise(n_terms = first(df), n_sig = sum(p < 0.05), p_max = max(p)),
+            by = "block")
+rm(wald_rows)   # large; not needed later
+```
+
+## Results
+
+**Choosing $k$ and $n$.** Gain over the model before the block:
+
+```{r}
+bind_rows(tuning4) |>
+  transmute(Block = if_else(block == "G", "G. Nearest airports (k)", "J. National components (n)"),
+            Setting = as.character(setting),
+            `MSE gain` = gain, `Std. error` = se,
+            Chosen = if_else(paste0(block, setting) %in% c(best_G, best_J), "yes", "")) |>
+  show_table("Step 4: choosing the number of nearest airports (k) and of national components (n).", digits = 2)
+```
+
+```{r}
+block_names4 <- c(G = "G. Nearest airports", I = "I. Pressure gradient",
+                  H = "H. Upwind airports", J = "J. National components")
+
+step4_results |>
+  transmute(Block = paste(block_names4[block], if_else(setting == "", "", paste0("(", setting, ")"))),
+            `Added terms` = as.character(n_terms),
+            `Significant (p < 0.05)` = paste(n_sig, "/ 15"),
+            `Largest p` = format.pval(p_max, digits = 2, eps = 1e-16),
+            `MSE gain` = gain, `Std. error` = se,
+            `Years better` = paste(years_improved, "/ 10"),
+            Decision = decision) |>
+  show_table("Step 4: each block compared with the model before it.", digits = 2)
+
+lead_table <- function(cv, models, labels) {
+  score(filter(cv, method %in% models), lead) |>
+    mutate(Model = labels[method]) |>
+    select(Model, lead, mse) |>
+    pivot_wider(names_from = lead, values_from = mse, names_prefix = "Lead ") |>
+    left_join(score(filter(cv, method %in% models)) |>
+                transmute(Model = labels[method], `All leads` = mse, `Day-15 MSE` = mse_day15),
+              by = "Model")
+}
+lead_table(step4_cv, c("S3", step4_final),
+           setNames(c("Step 3 model", "Step 4 model"), c("S3", step4_final))) |>
+  show_table("All-start-days MSE (°F²) by lead, before and after Step 4.")
+```
+
+```{r}
+r4   <- \(b, col) step4_results[[col]][step4_results$block == b]
+mse4 <- \(m, col = "mse") score(filter(step4_cv, method == m))[[col]]
+lead4 <- score(filter(step4_cv, method %in% c("S3", step4_final)), lead)
+lead_mse <- \(m, l) fmt(lead4$mse[lead4$method == m & lead4$lead == l], 1)
+```
+
+**What we found.**
+
+-   **All four blocks pass** our rule.
+-   **Upwind airports help the most** (gain `r fmt(r4("H", "gain"))`). Weather mostly moves from west to east, so airports to the west show what is coming. National components add `r fmt(r4("J", "gain"))` and the nearest airports `r fmt(r4("G", "gain"))`.
+-   **The pressure gradient adds only a little** (`r fmt(r4("I", "gain"))`). For one airport, the gradient is an exact combination of the pressures of the target and its 5 nearest airports, which are already in the model. It still adds something, because our model shares one slope per input across all 15 airports, while the gradient weights depend on where each airport's neighbors are.
+-   **The gain now reaches longer leads.** Lead 1: `r lead_mse("S3", 1)` → `r lead_mse(step4_final, 1)`. Lead 3: `r lead_mse("S3", 3)` → `r lead_mse(step4_final, 3)`. Lead 5: `r lead_mse("S3", 5)` → `r lead_mse(step4_final, 5)`.
+-   **The chosen $k$ and $n$ are the largest we tried.** More airports or more components might help further. Step 5 tests this directly by using all airports with a penalty.
+
+## Next step
+
+-   **New model to beat:** the Step 4 model, MSE `r fmt(mse4(step4_final), 1)` (day-15 MSE `r fmt(mse4(step4_final, "mse_day15"), 1)`), down from `r fmt(mse4("S3"), 1)`.
+-   **Step 5: penalized regression.** Use every airport as a separate input, and compare ridge, Lasso and elastic net with the Step 4 model.
+
+
+# Step 5: Penalized regression with all airports
+
+## Model
+
+In Step 4 we compressed the other airports by hand (nearest airports, gradient, upwind bands, national components), and the best $k$ and $n$ were the largest we tried. Here we let a **penalty** do the compression instead.
+
+-   **One model per target airport, temperature type and lead** (225 models). The inputs are specific airports (for example "Seattle pressure"), and a slope on Seattle should differ between Denver and Boston. This also lets the lag and local-weather slopes differ by airport.
+-   **Inputs:** the 15 lags, the Step 3 local weather, the seasonal terms, and **every other airport's** mean temperature and pressure (departure and 1-day change). This replaces the Step 4 inputs.
+-   **Penalty:** ridge ($\alpha = 0$), elastic net ($\alpha = 0.5$) and Lasso ($\alpha = 1$). The intercept and the seasonal terms are **not** penalized; everything else is. Inputs are standardized.
+-   **Choosing $\lambda$:** one $\lambda$ per method, shared by all 225 models (the response is standardized in each model, so one $\lambda$ means the same amount of shrinkage everywhere). We use the largest $\lambda$ whose MSE is within 2 standard errors of the best one.
+-   **Decision:** the method with the lowest MSE is compared with the Step 4 model, which counts as the simpler model.
+
+```{r}
+local_cols  <- c(kept, paste0(setdiff(kept, "pressure"), "_d1"))   # Step 3 inputs
+season_cols <- c("sin1", "cos1", "sin2", "cos2")
+lambda_grid <- 10^seq(0, -4, length.out = 25)
+alphas      <- c(Ridge = 0, `Elastic net` = 0.5, Lasso = 1)
+train_sets  <- setNames(lapply(cv_years, training_origins), cv_years)
+model_keys  <- distinct(step4_rows, airport, target, lead)
+
+# Rows and input matrix for model i (one target airport, temperature type and lead).
+# Other airports: t_ = temperature departure, tc_ = its 1-day change, p_ / pc_ = pressure.
+penalized_data <- function(i) {
+  a <- model_keys$airport[i]
+  g <- filter(step4_rows, airport == a, target == model_keys$target[i],
+              lead == model_keys$lead[i], !is.na(actual))
+  day   <- match(g$origin, all_dates)
+  self  <- match(a, airports)
+  press <- setdiff(which(has_press), self)
+  other <- cbind(dep_temp[day, -self], chg_temp[day, -self],
+                 dep_press[day, press], chg_press[day, press])
+  colnames(other) <- c(paste0("t_", airports[-self]), paste0("tc_", airports[-self]),
+                       paste0("p_", airports[press]), paste0("pc_", airports[press]))
+  list(g = g, X = cbind(as.matrix(g[, c(lag_cols, local_cols, season_cols)]), other))
+}
+
+# Forecasts for every held-out year, method and lambda.
+# `years`, `sets`, `methods` and `lambdas` are changed in Step 6.
+fit_penalized <- function(i, years = cv_years, sets = train_sets,
+                          methods = alphas, lambdas = lambda_grid) {
+  d  <- penalized_data(i)
+  g  <- d$g
+  X  <- d$X
+  pf <- as.numeric(!colnames(X) %in% season_cols)       # 0 = not penalized
+  y  <- g$actual
+  preds <- lapply(methods, \(al) matrix(NA_real_, nrow(g), length(lambdas)))
+  for (yr in years) {
+    train <- g$origin %in% sets[[as.character(yr)]]
+    test  <- g$year == yr
+    used  <- apply(X[train, ], 2, sd) > 0                # drop inputs that never change
+    mu <- mean(y[train]); s <- sd(y[train])
+    for (m in names(methods)) {
+      fit <- glmnet(X[train, used], (y[train] - mu) / s, alpha = methods[[m]],
+                    lambda = lambdas, penalty.factor = pf[used], standardize = TRUE)
+      preds[[m]][test, ] <- mu + s * predict(fit, X[test, used, drop = FALSE])
+    }
+  }
+  list(rows = select(g, origin, airport, target, lead, year, month, day15, actual),
+       preds = preds, n_inputs = ncol(X))
+}
+
+n_cores <- if (.Platform$OS.type == "windows") 1 else max(1, detectCores() - 1)
+fits <- mclapply(seq_len(nrow(model_keys)), fit_penalized, mc.cores = n_cores)
+
+pen_rows <- bind_rows(lapply(fits, `[[`, "rows"))
+n_inputs <- fits[[1]]$n_inputs
+yearly_mse <- function(pred) {
+  drop(rowsum((pen_rows$actual - pred)^2, pen_rows$year) / rowsum(rep(1, nrow(pen_rows)), pen_rows$year))
+}
+
+# Step 4 model, in the same row order
+key <- \(d) paste(d$origin, d$airport, d$target, d$lead)
+s4  <- filter(step4_cv, method == step4_final)
+s4  <- s4[match(key(pen_rows), key(s4)), ]
+stopifnot(identical(s4$actual, pen_rows$actual))
+
+step5_cv    <- list(mutate(s4, method = "Step 4 model"))
+lambda_path <- list()
+chosen      <- c()
+for (m in names(alphas)) {
+  P <- do.call(rbind, lapply(fits, \(f) f$preds[[m]]))
+  Y <- apply(P, 2, yearly_mse)                      # years x lambda values
+  pooled <- colMeans((pen_rows$actual - P)^2)
+  best <- which.min(pooled)
+  for (j in seq_along(lambda_grid)) {               # largest lambda within 2 SE of the best
+    d <- Y[, j] - Y[, best]
+    if (j == best || mean(d) <= 2 * sd(d) / sqrt(length(d))) break
+  }
+  chosen[m] <- j
+  lambda_path[[m]] <- tibble(method = m, lambda = lambda_grid, mse = pooled)
+  step5_cv[[m]] <- mutate(pen_rows, pred = P[, j], method = m)
+}
+rm(fits, P)
+step5_cv      <- bind_rows(step5_cv)
+lambda_path   <- bind_rows(lambda_path)
+step5_overall <- score(step5_cv)
+best_method   <- step5_overall |> filter(method != "Step 4 model") |> slice_min(mse) |> pull(method)
+step5_final   <- if (compare(step5_cv, "Step 4 model", best_method)$decision == "keep new terms") best_method else "Step 4 model"
+```
+
+## Results
+
+Each model has `r n_inputs` inputs and about `r format(round(nrow(pen_rows) / nrow(model_keys)), big.mark = ",")` forecasts.
+
+```{r}
+#| fig-width: 7
+#| fig-height: 3.5
+#| fig-cap: "Cross-validated MSE against the penalty size, for each method. Dots: the chosen lambda. Dashed line: the Step 4 model."
+
+chosen_points <- lambda_path |>
+  group_by(method) |>
+  filter(row_number() == chosen[first(method)])
+
+ggplot(lambda_path, aes(lambda, mse, color = method)) +
+  geom_hline(yintercept = filter(step5_overall, method == "Step 4 model")$mse,
+             linetype = "dashed", color = "grey40") +
+  geom_line(linewidth = 0.8) +
+  geom_point(data = chosen_points, size = 2.5) +
+  scale_x_log10() +
+  scale_color_manual(values = method_colors, name = NULL) +
+  coord_cartesian(ylim = c(NA, 46)) +
+  labs(x = "Penalty size (lambda, log scale)", y = "MSE (°F²)") +
+  theme_minimal(base_size = 11) +
+  theme(panel.grid.minor = element_blank(), legend.position = "bottom")
+```
+
+```{r}
+step5_overall |>
+  mutate(order = match(method, c("Step 4 model", names(alphas)))) |>
+  arrange(order) |>
+  rowwise() |>
+  mutate(cmp = list(if (method == "Step 4 model") NULL else compare(step5_cv, "Step 4 model", method))) |>
+  ungroup() |>
+  transmute(Model = method,
+            Lambda = if_else(method == "Step 4 model", "",
+                             signif(lambda_grid[chosen[method]], 2) |> as.character()),
+            `All-start-days MSE` = mse,
+            `Day-15 MSE` = mse_day15,
+            `Gain over Step 4` = sapply(cmp, \(r) if (is.null(r)) NA else r$gain),
+            `Std. error` = sapply(cmp, \(r) if (is.null(r)) NA else r$se),
+            `Years better` = sapply(cmp, \(r) if (is.null(r)) "" else paste(r$years_improved, "/ 10"))) |>
+  show_table("Step 5: penalized per-airport models compared with the Step 4 model.", digits = 2)
+
+lead_table(step5_cv, c("Step 4 model", best_method),
+           setNames(c("Step 4 model", best_method), c("Step 4 model", best_method))) |>
+  show_table("All-start-days MSE (°F²) by lead.")
+```
+
+```{r}
+mse5 <- \(m, col = "mse") filter(step5_overall, method == m)[[col]]
+gain5 <- \(m) compare(step5_cv, "Step 4 model", m)
+```
+
+**What we found.**
+
+-   **All three penalized methods beat the Step 4 model**, in all 10 years. The best is **`r best_method`** (MSE `r fmt(mse5(best_method))`, gain `r fmt(gain5(best_method)$gain)` with standard error `r fmt(gain5(best_method)$se)`).
+-   **The three methods are close**: `r paste(sprintf("%s %.2f", names(alphas), sapply(names(alphas), mse5)), collapse = ", ")`. The choice of inputs mattered more than the type of penalty.
+-   **The penalty is essential.** With almost no penalty (left end of the figure), the models overfit and do worse than the Step 4 model. With too much penalty (right end), Lasso and elastic net drop almost every input and fall back toward the seasonal curve.
+-   **Letting the penalty choose beats choosing by hand.** Step 4's hand-made inputs captured most, but not all, of what the other airports can tell us.
+
+## Next step
+
+-   **New model to beat:** `r step5_final`, MSE `r fmt(mse5(step5_final), 1)` (day-15 MSE `r fmt(mse5(step5_final, "mse_day15"), 1)`), down from `r fmt(mse5("Step 4 model"), 1)`.
+
+
+# Step 6: Final checks
+
+## Does the result hold forward and backward in time?
+
+So far every fold trained on all other years, both earlier and later. The validation year is probably after 2014, so we also check two one-directional schemes for the two finalists (the Step 4 model and `r best_method`):
+
+-   **Forward:** test 2010-2014, each year trained on the years **before** it only.
+-   **Backward:** test 2005-2009, each year trained on the years **after** it only.
+
+The 30-day gap stays. The national components are refitted on each fold's training days. The penalty $\lambda$ stays at the value chosen in Step 5.
+
+```{r}
+year_of_date <- \(d) as.integer(format(d, "%Y"))
+scheme_years <- list(Forward = 2010:2014, Backward = 2005:2009)
+scheme_keep  <- list(Forward = \(d, yr) year_of_date(d) < yr,
+                     Backward = \(d, yr) year_of_date(d) > yr)
+
+# Training start days and national components for each scheme and test year
+scheme_train <- lapply(names(scheme_years), \(s) setNames(lapply(scheme_years[[s]], \(yr) {
+  train <- training_origins(yr)
+  train[scheme_keep[[s]](train, yr)]
+}), scheme_years[[s]])) |> setNames(names(scheme_years))
+
+scheme_pcs <- lapply(names(scheme_years), \(s) setNames(lapply(scheme_years[[s]], \(yr) {
+  national_components(is_training_day(all_dates, yr) & scheme_keep[[s]](all_dates, yr))[, pc_names(n_J), drop = FALSE]
+}), scheme_years[[s]])) |> setNames(names(scheme_years))
+
+# The Step 4 model: if it uses national components, they enter as fold-specific columns
+s4_uses_pcs <- step4_final == "J"
+s4_formula  <- if (s4_uses_pcs) formulas4[[before_J]] else formulas4[[step4_final]]
+best_lambdas <- lambda_grid[seq_len(chosen[best_method])]   # path down to the chosen lambda
+
+scheme_cv <- list()
+for (s in names(scheme_years)) {
+  extra <- if (s4_uses_pcs) \(yr) scheme_pcs[[s]][[as.character(yr)]] else NULL
+  s4_s  <- run_cv_ols(s4_formula, "Step 4 model", step4_rows, daily_extra = extra,
+                      years = scheme_years[[s]], train_fun = \(yr) scheme_train[[s]][[as.character(yr)]])
+  fits_s <- mclapply(seq_len(nrow(model_keys)), fit_penalized,
+                     years = scheme_years[[s]], sets = scheme_train[[s]],
+                     methods = alphas[best_method], lambdas = best_lambdas, mc.cores = n_cores)
+  pen_s <- bind_rows(lapply(fits_s, \(f) mutate(f$rows, pred = f$preds[[1]][, length(best_lambdas)]))) |>
+    filter(year %in% scheme_years[[s]]) |>
+    mutate(method = best_method)
+  scheme_cv[[s]] <- bind_rows(s4_s, pen_s) |> mutate(scheme = s)
+}
+rm(fits_s)
+
+scheme_table <- bind_rows(
+  lapply(c("Leave one year out", names(scheme_years)), \(s) {
+    cv <- if (s == "Leave one year out") step5_cv else scheme_cv[[s]]
+    sc <- score(cv)
+    r  <- compare(cv, "Step 4 model", best_method)
+    tibble(Scheme = s,
+           `Test years` = if (s == "Leave one year out") "2005-2014" else paste(range(scheme_years[[s]]), collapse = "-"),
+           `Step 4 model` = sc$mse[sc$method == "Step 4 model"],
+           !!best_method := sc$mse[sc$method == best_method],
+           Gain = r$gain, `Std. error` = r$se,
+           `Years better` = paste(r$years_improved, "/", length(unique(cv$year))))
+  })
+)
+```
+
+```{r}
+show_table(scheme_table, "All-start-days MSE (°F²) of the two finalists under each scheme.", digits = 2)
+```
+
+**What we found.**
+
+-   **`r best_method` beats the Step 4 model in every scheme** (gain `r paste(sprintf("%.2f", scheme_table$Gain), collapse = ", ")` for leave-one-year-out, forward and backward). The ranking does not depend on the direction of time.
+-   **The MSE levels differ between schemes** mainly because they test different years (2010-2014 against 2005-2009), and some years are harder to forecast than others. The gain of `r best_method` is similar in all three.
+
+## Expected MSE
+
+The final model is **`r step5_final`** (Step 5). Its leave-one-year-out scores are our estimate of the validation MSE. The day-15 score matches how the validation year is scored.
+
+```{r}
+final_cv <- filter(step5_cv, method == step5_final)
+final_year <- score(final_cv, year)
+
+final_year |>
+  transmute(Year = as.character(year), `Day-15 MSE` = mse_day15, `All-start-days MSE` = mse) |>
+  pivot_longer(-Year, names_to = "Score") |>
+  pivot_wider(names_from = Year, values_from = value) |>
+  show_table("Final model: MSE (°F²) of each held-out year.")
+
+expected <- score(final_cv)
+```
+
+-   **Expected validation MSE: about `r fmt(expected$mse_day15, 1)`** (day-15 score, pooled over 2005-2014). Single years ranged from **`r fmt(min(final_year$mse_day15), 1)` to `r fmt(max(final_year$mse_day15), 1)`**, so the validation score can easily land anywhere in that range.
+-   This estimate is slightly optimistic, because the penalty $\lambda$ was chosen with the same folds. Only one $\lambda$ per method was tuned, so the effect should be small.
+
+**Breakdown** (all-start-days MSE, which is less noisy):
+
+```{r}
+breakdown <- function(cv, var) {
+  cv <- mutate(cv, group = .data[[var]])
+  score(cv, group, target) |>
+    select(group, target, mse) |>
+    pivot_wider(names_from = target, values_from = mse) |>
+    left_join(score(cv, group) |> select(group, All = mse), by = "group") |>
+    mutate(group = as.character(group)) |>
+    rename(!!var := group)
+}
+breakdown(final_cv, "lead") |>
+  show_table("Final model: MSE (°F²) by lead and temperature type.")
+breakdown(mutate(final_cv, airport = factor(airport, levels = target_airports)), "airport") |>
+  show_table("Final model: MSE (°F²) by airport and temperature type.")
+```
+
+```{r}
+#| fig-width: 7
+#| fig-height: 3.5
+#| fig-cap: "Final model: all-start-days MSE by month of the start day and temperature type."
+
+score(final_cv, month, target) |>
+  ggplot(aes(month, mse, color = target)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 2) +
+  scale_color_manual(values = method_colors, name = NULL) +
+  scale_x_continuous(breaks = 1:12, labels = month.abb) +
+  scale_y_continuous(limits = c(0, NA)) +
+  labs(x = "Month of the start day", y = "MSE (°F²)") +
+  theme_minimal(base_size = 11) +
+  theme(panel.grid.minor = element_blank(), legend.position = "bottom")
+```
+
+```{r}
+lead_final    <- score(final_cv, lead)
+airport_final <- score(final_cv, airport)
+month_final   <- score(final_cv, month)
+```
+
+-   **By lead:** from `r fmt(lead_final$mse[1], 1)` one day ahead to `r fmt(lead_final$mse[5], 1)` five days ahead.
+-   **By airport:** lowest at `r airport_final$airport[which.min(airport_final$mse)]` (`r fmt(min(airport_final$mse), 1)`), highest at `r airport_final$airport[which.max(airport_final$mse)]` (`r fmt(max(airport_final$mse), 1)`).
+-   **By month:** lowest in `r month.name[month_final$month[which.min(month_final$mse)]]` (`r fmt(min(month_final$mse), 1)`), highest in `r month.name[month_final$month[which.max(month_final$mse)]]` (`r fmt(max(month_final$mse), 1)`). Winter weather changes more from day to day.
+
+## Two extra checks
+
+1.  **Order.** The forecasts should satisfy min ≤ mean ≤ max. When they do not, we can move them to the closest ordered values (isotonic regression: average the values that are out of order).
+2.  **Mean from max and min.** The daily mean is almost exactly (max + min) / 2, so we can forecast it as the average of the max and min forecasts instead of directly.
+
+Each is kept only if it passes our rule.
+
+```{r}
+triplets <- final_cv |>
+  select(origin, airport, lead, year, month, day15, target, actual, pred) |>
+  pivot_wider(names_from = target, values_from = c(actual, pred)) |>
+  filter(if_all(starts_with("pred_"), \(x) !is.na(x)), if_all(starts_with("actual_"), \(x) !is.na(x)))
+
+out_of_order <- with(triplets, !(pred_Min <= pred_Mean & pred_Mean <= pred_Max))
+pred_cols <- c("pred_Min", "pred_Mean", "pred_Max")
+m <- as.matrix(triplets[, pred_cols])
+if (any(out_of_order)) {
+  m[out_of_order, ] <- t(apply(m[out_of_order, , drop = FALSE], 1, \(z) isoreg(z)$yf))
+}
+fixed <- triplets
+fixed[, pred_cols] <- as.data.frame(m)
+
+to_long <- function(d, name) {
+  d |>
+    pivot_longer(c(starts_with("actual_"), starts_with("pred_")),
+                 names_to = c(".value", "target"), names_sep = "_") |>
+    mutate(method = name)
+}
+order_check <- compare(bind_rows(to_long(triplets, "As forecast"), to_long(fixed, "Order fixed")),
+                       "As forecast", "Order fixed")
+
+mean_rows <- triplets |>
+  transmute(origin, airport, lead, year, month, day15, actual = actual_Mean,
+            Direct = pred_Mean, `From max and min` = (pred_Max + pred_Min) / 2) |>
+  pivot_longer(c(Direct, `From max and min`), names_to = "method", values_to = "pred")
+mean_check <- compare(mean_rows, "Direct", "From max and min")
+
+use_order_fix          <- order_check$decision == "keep new terms"
+use_mean_from_extremes <- mean_check$decision == "keep new terms"
+
+bind_rows(mutate(order_check, Check = "Fix the order"),
+          mutate(mean_check, Check = "Mean from max and min (mean forecasts only)")) |>
+  transmute(Check, `MSE gain` = gain, `Std. error` = se,
+            `Years better` = paste(years_improved, "/ 10"), Decision = decision) |>
+  show_table("Extra checks on the final model's forecasts.", digits = 3)
+```
+
+-   **Order:** only `r sum(out_of_order)` of `r format(nrow(triplets), big.mark = ",")` forecast triplets are out of order. `r if (use_order_fix) "Fixing them passes our rule, so the final forecasts are fixed." else "Fixing them makes no real difference, so we leave the forecasts as they are."`
+-   **Mean:** `r if (use_mean_from_extremes) "The average of the max and min forecasts is better, so the final mean forecast uses it." else "The direct forecast is as good or better, so we keep it."`
+
+## Final model and forecasting the validation year
+
+We refit the final model on all ten years and save everything needed for forecasting in `final_models.rds`. The script `predict.R` uses it to forecast the validation year:
+
+```sh
+Rscript predict.R validation.rda forecasts.csv
+```
+
+`predict.R` cleans the new data with the general rules of `preprocess.qmd`, builds the same inputs for the 15th of each month, and writes the 2,700 forecasts. **Missing inputs in the validation year:** a missing temperature at the target airport is filled from the days before and after it (within the 15 days); any other missing input is set to its normal value (departure 0), as for other airports in Step 4.
+
+```{r}
+stopifnot(step5_final != "Step 4 model")    # predict.R is written for the penalized models
+
+final_fits <- mclapply(seq_len(nrow(model_keys)), \(i) {
+  d  <- penalized_data(i)
+  X  <- d$X
+  y  <- d$g$actual
+  used <- apply(X, 2, sd) > 0
+  pf   <- as.numeric(!colnames(X) %in% season_cols)
+  mu <- mean(y); s <- sd(y)
+  fit <- glmnet(X[, used], (y - mu) / s, alpha = alphas[[best_method]], lambda = best_lambdas,
+                penalty.factor = pf[used], standardize = TRUE)
+  b <- as.matrix(coef(fit))[, length(best_lambdas)]
+  list(airport = model_keys$airport[i], target = model_keys$target[i], lead = model_keys$lead[i],
+       mu = mu, s = s, coef = b[b != 0 | names(b) == "(Intercept)"])
+}, mc.cores = n_cores)
+
+# Seasonal curves (5 coefficients per airport) used to compute departures
+normal_coefs <- function(raw) {
+  out <- sapply(seq_len(ncol(raw)), \(j) {
+    ok <- !is.na(raw[, j])
+    if (sum(ok) < 10) rep(NA_real_, ncol(season_x)) else qr.coef(qr(season_x[ok, ]), raw[ok, j])
+  })
+  colnames(out) <- colnames(raw)
+  out
+}
+wc <- weather_clean |>
+  mutate(wind_u = Mean.Wind.SpeedMPH * sin(WindDirDegrees * pi / 180),
+         wind_v = Mean.Wind.SpeedMPH * cos(WindDirDegrees * pi / 180))
+wide_of <- function(variable) {
+  wc |> select(date, airport, value = all_of(variable)) |>
+    pivot_wider(names_from = airport, values_from = value) |>
+    arrange(date) |> select(all_of(airports)) |> as.matrix()
+}
+local_sources <- c(t_Max = "Max.TemperatureF", t_Mean = "Mean.TemperatureF", t_Min = "Min.TemperatureF",
+                   pressure = "Mean.Sea.Level.PressureIn", dew_point = "Mean.DewPointF",
+                   humidity = "Mean.Humidity", wind_u = "wind_u", wind_v = "wind_v",
+                   cloud = "CloudCover", visibility = "Mean.VisibilityMiles", precip = "PrecipitationIn")
+
+final_models <- list(
+  models          = final_fits,
+  method          = best_method,
+  lambda          = lambda_grid[chosen[best_method]],
+  normals_local   = lapply(local_sources, \(v) normal_coefs(wide_of(v))),
+  normals_temp    = normal_coefs(raw_temp),
+  normals_press   = normal_coefs(raw_press),
+  airports        = airports,
+  has_press       = has_press,
+  target_airports = target_airports,
+  omega           = omega,
+  use_order_fix          = use_order_fix,
+  use_mean_from_extremes = use_mean_from_extremes
+)
+saveRDS(final_models, "final_models.rds")
+```
+
+The final model has `r length(final_fits)` regressions. On average each keeps `r round(mean(sapply(final_fits, \(f) length(f$coef) - 1)))` of its `r n_inputs` inputs (elastic net sets the rest to 0).
